@@ -1,0 +1,132 @@
+// secp256k1 field multiplication: r = a * b  mod P
+// P = 2^256 - 2^32 - 977,  C = 2^32 + 977 = 0x1000003D1
+//
+// Schoolbook 4×4 → 8-limb product, then fold top 4 limbs back via P.
+//
+// Register layout:
+//   R0-R3  = a[0..3]  (input)
+//   R4-R7  = b[0..3]  (input)
+//   R8-R15 = t[0..7]  (512-bit product, intermediate)
+
+motor fe_mul {
+    @register(R0)  u64 a0; @register(R1) u64 a1;
+    @register(R2)  u64 a2; @register(R3) u64 a3;
+    @register(R4)  u64 b0; @register(R5) u64 b1;
+    @register(R6)  u64 b2; @register(R7) u64 b3;
+    @register(R8)  u64 t0; @register(R9)  u64 t1;
+    @register(R10) u64 t2; @register(R11) u64 t3;
+    @register(R12) u64 t4; @register(R13) u64 t5;
+    @register(R14) u64 t6; @register(R15) u64 t7;
+
+    // ── Row 0: t[0..4] = a0 * b[0..3] ──────────────────────────────────
+    t0 = mul_lo64(a0, b0);
+    t1 = mulhi64(a0, b0);
+    t1 = mad_lo_cc64(a0, b1, t1);
+    t2 = madc_hi64(a0, b1, 0);
+    t2 = mad_lo_cc64(a0, b2, t2);
+    t3 = madc_hi64(a0, b2, 0);
+    t3 = mad_lo_cc64(a0, b3, t3);
+    t4 = madc_hi64(a0, b3, 0);
+
+    // ── Row 1: accumulate a1 * b[0..3] into t[1..5] ─────────────────────
+    t1 = mad_lo_cc64(a1, b0, t1);
+    t2 = madc_lo_cc64(a1, b1, t2);
+    t3 = madc_lo_cc64(a1, b2, t3);
+    t4 = madc_lo_cc64(a1, b3, t4);
+    t5 = addc64(0, 0);
+    t2 = mad_hi_cc64(a1, b0, t2);
+    t3 = madc_hi_cc64(a1, b1, t3);
+    t4 = madc_hi_cc64(a1, b2, t4);
+    t5 = madc_hi64(a1, b3, t5);
+
+    // ── Row 2: accumulate a2 * b[0..3] into t[2..6] ─────────────────────
+    t2 = mad_lo_cc64(a2, b0, t2);
+    t3 = madc_lo_cc64(a2, b1, t3);
+    t4 = madc_lo_cc64(a2, b2, t4);
+    t5 = madc_lo_cc64(a2, b3, t5);
+    t6 = addc64(0, 0);
+    t3 = mad_hi_cc64(a2, b0, t3);
+    t4 = madc_hi_cc64(a2, b1, t4);
+    t5 = madc_hi_cc64(a2, b2, t5);
+    t6 = madc_hi64(a2, b3, t6);
+
+    // ── Row 3: accumulate a3 * b[0..3] into t[3..7] ─────────────────────
+    t3 = mad_lo_cc64(a3, b0, t3);
+    t4 = madc_lo_cc64(a3, b1, t4);
+    t5 = madc_lo_cc64(a3, b2, t5);
+    t6 = madc_lo_cc64(a3, b3, t6);
+    t7 = addc64(0, 0);
+    t4 = mad_hi_cc64(a3, b0, t4);
+    t5 = madc_hi_cc64(a3, b1, t5);
+    t6 = madc_hi_cc64(a3, b2, t6);
+    t7 = madc_hi64(a3, b3, t7);
+
+    // ── Reduction: P = 2^256 - C, C = 2^32 + 977 = 0x1000003D1 ──────────
+    // Fold t4..t7 back into t0..t3 using:
+    //   high_part * C  =  high * 977  +  high * 2^32
+    //
+    // Step A: t[0..3] += t[4..7] * 977
+    u64 c977; u64 cC; u64 t4l; u64 t4s;
+    c977 = 977;
+    cC = 0x1000003D1;
+    t4s = t4;
+    t0 = mad_lo_cc64(t4, c977, t0);
+    t1 = madc_lo_cc64(t5, c977, t1);
+    t2 = madc_lo_cc64(t6, c977, t2);
+    t3 = madc_lo_cc64(t7, c977, t3);
+    t4l = addc64(0, 0);
+    t1 = mad_hi_cc64(t4, c977, t1);
+    t2 = madc_hi_cc64(t5, c977, t2);
+    t3 = madc_hi_cc64(t6, c977, t3);
+    t4 = madc_hi64(t7, c977, t4l);
+
+    // Step B: t[0..3] += t[4..7] << 32  (= t[4..7] * 2^32)
+    // t[i] << 32: hi_part = t[i] >> 32, lo_part = t[i] << 32
+    u64 c32;
+    c32 = 32;
+    u64 t4_lo; u64 t4_hi;
+    u64 t5_lo; u64 t5_hi;
+    u64 t6_lo; u64 t6_hi;
+    u64 t7_lo; u64 t7_hi;
+    t4_lo = t4s << c32;
+    t4_hi = t4s >> c32;
+    t5_lo = t5 << c32;
+    t5_hi = t5 >> c32;
+    t6_lo = t6 << c32;
+    t6_hi = t6 >> c32;
+    t7_lo = t7 << c32;
+    t7_hi = t7 >> c32;
+
+    t0 = add_cc64(t0, t4_lo);
+    t1 = addc_cc64(t1, t4_hi);
+    t1 = addc_cc64(t1, t5_lo);
+    t2 = addc_cc64(t2, t5_hi);
+    t2 = addc_cc64(t2, t6_lo);
+    t3 = addc_cc64(t3, t6_hi);
+    t3 = addc_cc64(t3, t7_lo);
+    t4 = addc64(t7_hi, t4);
+
+    // Step C: second fold by C using one exact 64x64->128 multiply.
+    // No truncating shift — t4*C captured fully in lo/hi halves.
+    if (t4 != 0) {
+        u64 t4C_lo; u64 t4C_hi;
+        t4C_lo = mul_lo64(t4, cC);
+        t4C_hi = mulhi64(t4, cC);
+        t0 = add_cc64(t0, t4C_lo);
+        t1 = addc_cc64(t1, t4C_hi);
+        t2 = addc_cc64(t2, 0);
+        t3 = addc64(t3, 0);
+    }
+
+    // Write result back into a0..a3
+    a0 = t0; a1 = t1; a2 = t2; a3 = t3;
+}
+
+transmission fe_mul_bench {
+    grid (256, 1, 1);
+    block (256, 1, 1);
+    motor fe_mul {
+        inout u64 a0; inout u64 a1; inout u64 a2; inout u64 a3;
+        in    u64 b0; in    u64 b1; in    u64 b2; in    u64 b3;
+    }
+}

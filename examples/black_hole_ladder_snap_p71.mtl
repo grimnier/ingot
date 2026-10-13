@@ -1,0 +1,187 @@
+// black_hole_ladder_snap_p71.mtl
+//
+// Language contract: advance_sig ladder snap gate, P71
+//
+// ── keyspace contract ──────────────────────────────────────────────────────────
+// range_low       = 0x400000000000000000   (2^70)
+// range_high      = 0x7fffffffffffffffff
+// packet_span     = 0x40000000             (2^30)
+// packet_cell     = bounded_scalar<40>
+// local_offset    = bounded_scalar<30>
+//
+// k = range_low + packet_cell * packet_span + local_offset
+//
+// ── snap rail ──────────────────────────────────────────────────────────────────
+// LadderX16[41]   low 16 bits of x(2^i · G), i=0..40
+// LadderX24[41]   low 24 bits of x(2^i · G), i=0..40
+// LadderParity[41] y-parity of 2^i · G, i=0..40
+//
+// AdvanceSig state: xx16, xx24, parity, ss16
+// SnapTail24 = 0xa0a5b8
+// SnapTail16 = 0xa5b8
+//
+// ── stream contract ────────────────────────────────────────────────────────────
+// continue_after_snap_hit — walk does NOT stop on snap
+// compact_hit_stream      — SnapHitEntry per hit, not per k
+// bounded_hit_buffer      — hit buffer has fixed capacity
+// overflow_counter        — counts hits that exceed buffer
+// sig_steps_per_sec       — throughput counter required
+//
+// ── forbid ─────────────────────────────────────────────────────────────────────
+// GX GY point_mul scalar_mul jac64
+// sha256 ripemd160 hash160_from_affine
+// black_hole_hash160_server TRUSTED_ENGINE subprocess external_worker
+
+profile ladder_snap_sm89 {
+    max_registers        = 96;
+    spill_allowed        = false;
+    local_memory_allowed = false;
+}
+
+motor ladder_snap_p71 {
+
+    // ── inputs ─────────────────────────────────────────────────────────────────
+    // Pre-initialized AdvanceSig state for packet start:
+    //   k_packet = range_low + packet_cell * packet_span
+    // Computed once per packet (CPU side), not inside this motor.
+    @register(R0)  u32  xx16_init;
+    @register(R1)  u32  xx24_init;
+    @register(R2)  u32  parity_init;
+    @register(R3)  u32  ss16_init;
+
+    @register(R4)  u64  packet_cell;     // bounded_scalar<40>
+    @register(R5)  u32  local_offset;    // bounded_scalar<30>, start of this thread's slice
+
+    // ── compact_hit_stream output ───────────────────────────────────────────────
+    @register(R6)  u64* hit_buf_k;       // landed_k_lo per hit
+    @register(R7)  u32* hit_buf_xx24;
+    @register(R8)  u32* hit_buf_xx16;
+    @register(R9)  u32* hit_buf_parity;
+    @register(R10) u32* hit_buf_ss16;
+    @register(R11) u32* hit_count;       // bounded_hit_buffer counter
+    @register(R12) u32* overflow_count;  // overflow_counter
+    @register(R13) u32  hit_limit;
+    @register(R14) u64* sig_steps;       // sig_steps_per_sec accumulator
+    @register(R15) u32* LadderX16;
+    @register(R16) u32* LadderX24;
+    @register(R17) u32* LadderParity;
+
+    // ── snap targets (embedded null — read only) ────────────────────────────────
+    u32 SNAP_TAIL24;
+    u32 SNAP_TAIL16;
+    SNAP_TAIL24 = 0xa0a5b8;
+    SNAP_TAIL16 = 0xa5b8;
+
+    // ── AdvanceSig state ────────────────────────────────────────────────────────
+    u32 xx16;
+    u32 xx24;
+    u32 parity;
+    u32 ss16;
+    xx16   = xx16_init;
+    xx24   = xx24_init;
+    parity = parity_init;
+    ss16   = ss16_init;
+
+    // ── walk local_offset over [local_offset, packet_span) ─────────────────────
+    // LadderX16/X24/Parity cover bits 0..40, sufficient for 30-bit local_offset carry
+    u32 steps;
+    u32 bit;
+    u32 n32;
+    u64 k_lo;
+    u32 cur;
+
+    steps = 0;
+    k_lo  = local_offset;
+
+    while (k_lo < 0x40000000) {
+
+        // snap check — continue_after_snap_hit: never break, never stop
+        if ((xx24 & 0xffffff) == SNAP_TAIL24) {
+            if ((xx16 & 0xffff) == SNAP_TAIL16) {
+                // compact_hit_stream: write entry if bounded_hit_buffer not full
+                cur = hit_count[0];
+                if (cur < hit_limit) {
+                    hit_buf_k[cur]      = k_lo;
+                    hit_buf_xx24[cur]   = xx24;
+                    hit_buf_xx16[cur]   = xx16;
+                    hit_buf_parity[cur] = parity;
+                    hit_buf_ss16[cur]   = ss16;
+                    hit_count[0]        = cur + 1;
+                } else {
+                    // overflow_counter
+                    overflow_count[0] = overflow_count[0] + 1;
+                }
+            }
+        }
+
+        // advance_sig: k_lo → k_lo + 1
+        // pop trailing 1-bits
+        bit = 0;
+        n32 = k_lo;
+        while (n32 & 1) {
+            xx16   = xx16   ^ LadderX16[bit];
+            xx24   = xx24   ^ LadderX24[bit];
+            parity = parity ^ LadderParity[bit];
+            ss16   = (ss16 - LadderX16[bit]) & 0xffff;
+            n32    = n32 >> 1;
+            bit    = bit + 1;
+        }
+        // push carry stop bit
+        xx16   = xx16   ^ LadderX16[bit];
+        xx24   = xx24   ^ LadderX24[bit];
+        parity = parity ^ LadderParity[bit];
+        ss16   = (ss16 + LadderX16[bit]) & 0xffff;
+
+        k_lo  = k_lo + 1;
+        steps = steps + 1;
+    }
+
+    // sig_steps_per_sec accumulator
+    sig_steps[0] = sig_steps[0] + steps;
+}
+
+transmission ladder_snap_p71_tx {
+    target nvidia.sm_89;
+    profile ladder_snap_sm89;
+    require no_spills;
+    require no_local_memory;
+    require continue_after_snap_hit;
+    require compact_hit_stream;
+    require bounded_hit_buffer;
+    require overflow_counter;
+    require sig_steps_per_sec;
+    forbid GX;
+    forbid GY;
+    forbid point_mul;
+    forbid scalar_mul;
+    forbid jac64;
+    forbid sha256;
+    forbid ripemd160;
+    forbid hash160_from_affine;
+    forbid black_hole_hash160_server;
+    forbid TRUSTED_ENGINE;
+    forbid subprocess;
+    forbid external_worker;
+    grid  (256, 1, 1);
+    block (256, 1, 1);
+    motor ladder_snap_p71 {
+        in    R0  u32  xx16_init;
+        in    R1  u32  xx24_init;
+        in    R2  u32  parity_init;
+        in    R3  u32  ss16_init;
+        in    R4  u64  packet_cell;
+        in    R5  u32  local_offset;
+        in    R6  u64* hit_buf_k;
+        in    R7  u32* hit_buf_xx24;
+        in    R8  u32* hit_buf_xx16;
+        in    R9  u32* hit_buf_parity;
+        in    R10 u32* hit_buf_ss16;
+        inout R11 u32* hit_count;
+        inout R12 u32* overflow_count;
+        in    R13 u32  hit_limit;
+        inout R14 u64* sig_steps;
+        in    R15 u32* LadderX16;
+        in    R16 u32* LadderX24;
+        in    R17 u32* LadderParity;
+    }
+}

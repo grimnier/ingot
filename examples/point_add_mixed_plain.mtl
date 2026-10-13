@@ -1,0 +1,59 @@
+// secp256k1 plain-operator mixed point add: (X1:Y1:Z1) + (x2,y2) -> (X3:Y3:Z3)
+// Formula: 8M + 3S (Jacobian + Affine, no identity branch on hot path)
+//
+// This is the WP1 plain-operator Motor.  It expresses only the mathematical
+// formula.  Lowering to carry-chain PTX intrinsics is defined by the
+// sealed profile in the transmission below.
+
+motor point_add_mixed_plain {
+    inout jacobian<secp256k1> walker;
+    in affine<secp256k1> table_point;
+
+    field z_squared = walker.z * walker.z;
+    field u2        = table_point.x * z_squared;
+    field z_cubed   = walker.z * z_squared;
+    field s2        = table_point.y * z_cubed;
+
+    field h         = u2 - walker.x;
+    field r         = s2 - walker.y;
+
+    field h_squared = h * h;
+    field z3        = walker.z * h;
+    field h_cubed   = h * h_squared;
+    field xh2       = walker.x * h_squared;
+    field r_squared = r * r;
+
+    field x3 = r_squared - h_cubed - (xh2 + xh2);
+    field y3 = r * (xh2 - x3) - walker.y * h_cubed;
+
+    walker = jacobian(x3, y3, z3);
+}
+
+transmission point_add_sm89 {
+    target nvidia.sm_89;
+    profile secp256k1_mixed_add_compat_v1;
+    verify semantic_equivalence;
+    verify native_text_equal(point_add_mixed_expanded_v1);
+    require no_spills;
+    require max_registers(96);
+    require no_global_intermediate_materialization;
+
+    motor point_add_mixed_plain {
+        inout registers(R0..R11) jacobian<secp256k1> walker;
+        in    registers(R12..R19) affine<secp256k1> table_point;
+    }
+}
+
+transmission point_add_sm89_z1_fast {
+    target nvidia.sm_89;
+    profile secp256k1_mixed_add_z1_v1;
+    require input_invariant(walker.z == field.one);
+    verify semantic_equivalence;
+    require no_spills;
+    require max_registers(96);
+
+    motor point_add_mixed_plain {
+        inout registers(R0..R11) jacobian<secp256k1> walker;
+        in    registers(R12..R19) affine<secp256k1> table_point;
+    }
+}

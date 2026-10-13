@@ -1,0 +1,28 @@
+// P18 cycle_timer.mtl -- hardware cycle counter intrinsic example
+//
+// Demonstrates clock64() and clock32() intrinsics.
+// Each thread writes the 64-bit hardware timer value into output[tid].
+//
+// PTX lowering:
+//   clock64() -> mov.u64 %rdN, %globaltimer;
+//   clock32() -> mov.u32 %rN,  %clock;
+
+motor timed_example {
+    @register(R0) u64* output;
+    @register(R1) u32  n;
+
+    u64 start = clock64();
+    u32 tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid < n) {
+        output[tid] = start;
+    }
+}
+
+transmission timed_example_launch {
+    grid  (256, 1, 1);
+    block (256, 1, 1);
+    motor timed_example {
+        inout u64* output;
+        in    u32  n;
+    }
+}

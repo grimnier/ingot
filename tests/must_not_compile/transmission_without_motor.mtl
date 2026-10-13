@@ -1,0 +1,10 @@
+(* This must be rejected: a transmission that references a motor that was never defined *)
+
+transmission orphan_pipeline {
+    grid  (1, 1, 1);
+    block (32, 1, 1);
+
+    motor this_motor_does_not_exist {
+        in float* data;
+    }
+}

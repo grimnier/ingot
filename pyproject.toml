@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ingot"
+version = "0.1.0"
+description = "Ingot GPU language compiler — Motor/Transmission architecture"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+ingotc = "ingot.tools.ingotc:main"
+ingot-spill-gate = "ingot.tools.spill_gate:main"
+ingot-validate = "ingot.tools.validate_kernel:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "tools*"]

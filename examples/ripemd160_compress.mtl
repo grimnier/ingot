@@ -1,0 +1,42 @@
+// RIPEMD160 Compression Function
+// 80 rounds, 5 working variables locked to physical registers R2-R6
+// Zero register spill — compiler forbidden from touching R2-R6
+
+motor ripemd160_compress {
+    @register(R0) float* msg;
+    @register(R1) float* state;
+    @register(R2) float a;
+    @register(R3) float b;
+    @register(R4) float c;
+    @register(R5) float d;
+    @register(R6) float e;
+
+    a = state[0];
+    b = state[1];
+    c = state[2];
+    d = state[3];
+    e = state[4];
+
+    for (int i = 0; i < 80; i = i + 1) {
+        float w;
+        float t;
+        w = msg[i];
+        t = a + b + c + w;
+        a = e;
+        e = d;
+        d = c + b;
+        c = b;
+        b = t;
+    }
+
+    state[0] = a + state[0];
+    state[1] = b + state[1];
+    state[2] = c + state[2];
+    state[3] = d + state[3];
+    state[4] = e + state[4];
+}
+
+transmission ripemd160_launch {
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+}

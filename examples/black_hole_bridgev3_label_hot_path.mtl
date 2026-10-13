@@ -1,0 +1,90 @@
+// black_hole_bridgev3_label_hot_path.mtl
+//
+// Ingot contract for the high-throughput bridge_packet_v3_qrail_cuda lane.
+// This is the label/contract fabric from bottom_end_cuda_mock_bridgev3.exe,
+// not the ECC coordinate verifier and not the HASH160 verifier.
+//
+// Runtime identity:
+//   k = A + packet_cell * packet_span + local_offset
+//   Q = AG + sum(2^eG) + zG
+//
+// The CUDA dyno emits:
+//   packet_labels
+//   true_virtual_integers
+//   routed_packets
+//   dyadic_mask_expansions
+//   z_side_rail_additions
+//   packet_q_contracts
+//   candidate_compare_contracts
+//
+// It explicitly reports hash_verifier=not_run.
+
+profile bridgev3_label_hot_path_sm89 {
+    max_registers        = 64;
+    spill_allowed        = false;
+    local_memory_allowed = false;
+}
+
+motor bridgev3_label_hot_path {
+    // BridgePacketV3Gpu fields.
+    @register(R0)  u64 anchor_lo;
+    @register(R1)  u64 dyadic_mask_lo;
+    @register(R2)  u64 tail_z_abs;
+    @register(R3)  u64 packet_cell;
+    @register(R4)  u64 packet_span;
+    @register(R5)  u64 local_offset;
+    @register(R6)  u64 candidates_per_packet;
+
+    // Derived contract labels/counters.
+    @register(R7)  u64 local_k_lo;
+    @register(R8)  u64 true_virtual_integers;
+    @register(R9)  u64 routed_packet;
+    @register(R10) u64 dyadic_mask_expansions;
+    @register(R11) u64 z_side_rail_additions;
+    @register(R12) u64 packet_q_contracts;
+    @register(R13) u64 candidate_compare_contracts;
+    @register(R14) u64 acc;
+
+    // Cheap packet/local route. The CUDA kernel does the same shape per row:
+    // local_k_lo = anchor + packet_cell * packet_span + local_offset.
+    local_k_lo = anchor_lo + (packet_cell * packet_span) + local_offset;
+
+    // Contract counters. In CUDA, dyadic_mask_expansions is popcount(mask);
+    // this language-level contract keeps the mask live and proves it is routed.
+    true_virtual_integers = packet_span;
+    routed_packet = 1;
+    dyadic_mask_expansions = dyadic_mask_lo & 0xFFFFFFFFFFFFFFFF;
+    z_side_rail_additions = tail_z_abs;
+    packet_q_contracts = candidates_per_packet;
+    candidate_compare_contracts = candidates_per_packet;
+
+    // Accumulator identity mirrors the CUDA dyno's route-pressure checksum.
+    acc = local_k_lo ^ (dyadic_mask_lo * 0x9E3779B97F4A7C15);
+    acc = acc ^ (tail_z_abs << 40);
+    acc = acc ^ (candidates_per_packet << 24);
+}
+
+transmission bridgev3_label_hot_path_tx {
+    target nvidia.sm_89;
+    profile bridgev3_label_hot_path_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(64);
+    motor bridgev3_label_hot_path {
+        inout R0  u64 anchor_lo;
+        inout R1  u64 dyadic_mask_lo;
+        inout R2  u64 tail_z_abs;
+        inout R3  u64 packet_cell;
+        inout R4  u64 packet_span;
+        inout R5  u64 local_offset;
+        inout R6  u64 candidates_per_packet;
+        inout R7  u64 local_k_lo;
+        inout R8  u64 true_virtual_integers;
+        inout R9  u64 routed_packet;
+        inout R10 u64 dyadic_mask_expansions;
+        inout R11 u64 z_side_rail_additions;
+        inout R12 u64 packet_q_contracts;
+        inout R13 u64 candidate_compare_contracts;
+        inout R14 u64 acc;
+    }
+}

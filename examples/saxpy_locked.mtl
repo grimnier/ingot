@@ -1,0 +1,20 @@
+// Heavy explicit register locking demo (Phase 1)
+
+motor saxpy_heavy_lock {
+    @register(R0) float alpha;
+    @register(R1) float* x;
+    @register(R2) float* y;
+    x[0] = x[0];
+    y[0] = alpha * x[0] + y[0];
+}
+
+transmission saxpy_heavy_launch {
+    grid ((n + 255) / 256 , 1, 1);
+    block (256, 1, 1);
+    motor saxpy_heavy_lock {
+        in  float  alpha;
+        in  float* x @align(16);
+        inout float* y @align(16);
+        in  int n;
+    }
+}

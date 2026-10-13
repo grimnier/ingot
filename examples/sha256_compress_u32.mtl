@@ -1,0 +1,78 @@
+// SHA256 Compression Function — full u32 arithmetic with K[i] round constants
+//
+// One 512-bit block (W[0..63] message schedule in msg[0..63]).
+// Working variables a-h in R2-R9 (u32, locked).
+// Pointers: R0=msg (u32*), R1=state (u32*), R10=k (u32* — 64 round constants).
+//
+// Full round function:
+//   s1  = (e>>6) ^ (e>>11) ^ (e>>25)          // Sigma1(e)
+//   ch  = (e&f) ^ (~e&g)                        // Ch(e,f,g)
+//   t1  = h + s1 + ch + k[i] + w
+//   s0  = (a>>2) ^ (a>>13) ^ (a>>22)           // Sigma0(a)
+//   maj = (a&b) ^ (a&c) ^ (b&c)                // Maj(a,b,c)
+//   t2  = s0 + maj
+//   h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2
+
+motor sha256_compress_u32 {
+    @register(R0)  u32* msg;
+    @register(R1)  u32* state;
+    @register(R10) u32* k;
+    @register(R2) u32 a;
+    @register(R3) u32 b;
+    @register(R4) u32 c;
+    @register(R5) u32 d;
+    @register(R6) u32 e;
+    @register(R7) u32 f;
+    @register(R8) u32 g;
+    @register(R9) u32 h;
+
+    a = state[0];
+    b = state[1];
+    c = state[2];
+    d = state[3];
+    e = state[4];
+    f = state[5];
+    g = state[6];
+    h = state[7];
+
+    for (int i = 0; i < 64; i = i + 1) {
+        u32 w;
+        u32 ki;
+        u32 s1;
+        u32 ch;
+        u32 t1;
+        u32 s0;
+        u32 ma;
+        u32 t2;
+        w  = msg[i];
+        ki = k[i];
+        s1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+        ch = (e & f) ^ (~e & g);
+        t1 = h + s1 + ch + ki + w;
+        s0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+        ma = (a & b) ^ (a & c) ^ (b & c);
+        t2 = s0 + ma;
+        h  = g;
+        g  = f;
+        f  = e;
+        e  = d + t1;
+        d  = c;
+        c  = b;
+        b  = a;
+        a  = t1 + t2;
+    }
+
+    state[0] = a + state[0];
+    state[1] = b + state[1];
+    state[2] = c + state[2];
+    state[3] = d + state[3];
+    state[4] = e + state[4];
+    state[5] = f + state[5];
+    state[6] = g + state[6];
+    state[7] = h + state[7];
+}
+
+transmission sha256_u32_launch {
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+}

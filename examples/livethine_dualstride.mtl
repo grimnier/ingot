@@ -1,0 +1,39 @@
+// Ingot MTL Native Specification — Livethine Dual-Stride Kernel
+// Zero-Spill Register-Locked PTX Pipeline
+
+motor tortoise_motor {
+    @window(R0..R7) field Tx;
+    @window(R8..R15) field Ty;
+    u64 step_count;
+    u32 target_gate;
+
+    __shared__ u64 s_tame_scan[512];
+
+    for (int i = 0; i < 1000; i = i + 1) {
+        field Gx;
+        field Gy;
+
+        __syncthreads();
+
+        u32 h160_digest = 235776692;
+        
+        if ((h160_digest % 4294967296) == target_gate) {
+            atomicAdd(s_tame_scan, 1);
+            break;
+        }
+    }
+}
+
+transmission livethine_dualstride_tx {
+    target nvidia.sm_89;
+    profile secp256k1_dualstride_v1;
+    grid(1, 1, 1);
+    block(256, 1, 1);
+
+    motor tortoise_motor {
+        inout registers(R0..R7) field Tx;
+        inout registers(R8..R15) field Ty;
+        in u64 step_count;
+        in u32 target_gate;
+    }
+}

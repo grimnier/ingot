@@ -1,0 +1,66 @@
+// black_hole_p71_null.mtl
+//
+// Match collector for P71 with the target null embedded as compile-time constants.
+//
+// Target address : 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU
+// Hash160        : f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8
+//
+// The 20-byte hash160 becomes 5 x u32 little-endian RIPEMD-160 state words:
+//   word0 = 0x1d43f5f6   (bytes  0-3:  f6 f5 43 1d)
+//   word1 = 0xb1f7bb25   (bytes  4-7:  25 bb f7 b1)
+//   word2 = 0x9add8a2e   (bytes  8-11: 2e 8a dd 9a)
+//   word3 = 0x5c47e3f5   (bytes 12-15: f5 e3 47 5c)
+//   word4 = 0xb8a5a044   (bytes 16-19: 44 a0 a5 b8)
+//
+// Null design:
+//   match = (w0 ^ 0x1d43f5f6) | (w1 ^ 0xb1f7bb25) | (w2 ^ 0x9add8a2e)
+//         | (w3 ^ 0x5c47e3f5) | (w4 ^ 0xb8a5a044)
+//
+//   match != 0  →  null space  →  hardware speed rejection, no branch taken
+//   match == 0  →  null        →  null break fires, candidate_offset written to hits
+
+profile p71_null_sm89 {
+    max_registers        = 96;
+    spill_allowed        = false;
+    local_memory_allowed = false;
+}
+
+motor match_p71 {
+
+    @register(R0) u32* rmd_state;
+    @register(R1) u64* hits;
+    @register(R2) u64  candidate_offset;
+
+    u32 w0; u32 w1; u32 w2; u32 w3; u32 w4;
+    u32 match;
+
+    w0 = rmd_state[0];
+    w1 = rmd_state[1];
+    w2 = rmd_state[2];
+    w3 = rmd_state[3];
+    w4 = rmd_state[4];
+
+    match = (w0 ^ 0x1d43f5f6)
+          | (w1 ^ 0xb1f7bb25)
+          | (w2 ^ 0x9add8a2e)
+          | (w3 ^ 0x5c47e3f5)
+          | (w4 ^ 0xb8a5a044);
+
+    if (match == 0) {
+        hits[0] = candidate_offset;
+    }
+}
+
+transmission match_p71_tx {
+    target nvidia.sm_89;
+    profile p71_null_sm89;
+    require no_spills;
+    require no_local_memory;
+    grid  (256, 1, 1);
+    block (256, 1, 1);
+    motor match_p71 {
+        in    R0 u32* rmd_state;
+        out   R1 u64* hits;
+        inout R2 u64  candidate_offset;
+    }
+}

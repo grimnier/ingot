@@ -1,0 +1,179 @@
+// RIPEMD-160 Compression Function — full u32 arithmetic
+//
+// Two parallel 80-round tracks (left + right), combined at the end.
+// All per-round lookup values (indices, rotations, constants) passed as arrays
+// so the motor body is loop-driven, not unrolled.
+//
+// Register layout:
+//   R0  = msg   (u32* 16 little-endian words)
+//   R1  = state (u32* 5 words, updated in-place)
+//   R2  = rl    (u32* 80 left-track message indices)
+//   R3  = rr    (u32* 80 right-track message indices)
+//   R4  = sl    (u32* 80 left-track rotation amounts)
+//   R5  = sr    (u32* 80 right-track rotation amounts)
+//   R6  = kl    (u32* 80 left-track round constants)
+//   R7  = kr    (u32* 80 right-track round constants)
+//   R8  = al    left-track A
+//   R9  = bl    left-track B
+//   R10 = cl    left-track C
+//   R11 = dl    left-track D
+//   R12 = el    left-track E
+//   R13 = ar    right-track A
+//   R14 = br    right-track B
+//   R15 = cr    right-track C
+//   R16 = dr    right-track D
+//   R17 = er    right-track E
+
+motor ripemd160_compress {
+    @register(R0)  u32* msg;
+    @register(R1)  u32* state;
+    @register(R2)  u32* rl;
+    @register(R3)  u32* rr;
+    @register(R4)  u32* sl;
+    @register(R5)  u32* sr;
+    @register(R6)  u32* kl;
+    @register(R7)  u32* kr;
+    @register(R8)  u32 al;
+    @register(R9)  u32 bl;
+    @register(R10) u32 cl;
+    @register(R11) u32 dl;
+    @register(R12) u32 el;
+    @register(R13) u32 ar;
+    @register(R14) u32 br;
+    @register(R15) u32 cr;
+    @register(R16) u32 dr;
+    @register(R17) u32 er;
+
+    al = state[0];
+    bl = state[1];
+    cl = state[2];
+    dl = state[3];
+    el = state[4];
+    ar = state[0];
+    br = state[1];
+    cr = state[2];
+    dr = state[3];
+    er = state[4];
+
+    // ── Left track (80 rounds) ──────────────────────────────────────────────
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f;
+        u32 idx;
+        u32 w;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp;
+
+        if (j < 16) {
+            f = bl ^ cl ^ dl;
+        } else {
+            if (j < 32) {
+                f = (bl & cl) | (~bl & dl);
+            } else {
+                if (j < 48) {
+                    f = (bl | ~cl) ^ dl;
+                } else {
+                    if (j < 64) {
+                        f = (bl & dl) | (cl & ~dl);
+                    } else {
+                        f = bl ^ (cl | ~dl);
+                    }
+                }
+            }
+        }
+
+        idx  = rl[j];
+        w    = msg[idx];
+        s    = sl[j];
+        ki   = kl[j];
+        tval = al + f + w + ki;
+        n32  = 32;
+        inv_s = n32 - s;
+        tmp  = (tval << s) | (tval >> inv_s);
+        tval = tmp + el;
+        al   = el;
+        el   = dl;
+        tmp  = (cl << 10) | (cl >> 22);
+        dl   = tmp;
+        cl   = bl;
+        bl   = tval;
+    }
+
+    // ── Right track (80 rounds) — reversed function order ──────────────────
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f;
+        u32 idx;
+        u32 w;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp;
+
+        if (j < 16) {
+            f = br ^ (cr | ~dr);
+        } else {
+            if (j < 32) {
+                f = (br & dr) | (cr & ~dr);
+            } else {
+                if (j < 48) {
+                    f = (br | ~cr) ^ dr;
+                } else {
+                    if (j < 64) {
+                        f = (br & cr) | (~br & dr);
+                    } else {
+                        f = br ^ cr ^ dr;
+                    }
+                }
+            }
+        }
+
+        idx  = rr[j];
+        w    = msg[idx];
+        s    = sr[j];
+        ki   = kr[j];
+        tval = ar + f + w + ki;
+        n32  = 32;
+        inv_s = n32 - s;
+        tmp  = (tval << s) | (tval >> inv_s);
+        tval = tmp + er;
+        ar   = er;
+        er   = dr;
+        tmp  = (cr << 10) | (cr >> 22);
+        dr   = tmp;
+        cr   = br;
+        br   = tval;
+    }
+
+    // ── Final combination (RIPEMD-160 spec) ────────────────────────────────
+    // T   = h1 + cl + dr  → new h0
+    // h1' = h2 + dl + er
+    // h2' = h3 + el + ar
+    // h3' = h4 + al + br
+    // h4' = h0 + bl + cr
+    // h0' = T
+    u32 t0;
+    u32 t1;
+    u32 t2;
+    u32 t3;
+    u32 t4;
+    t0 = state[1] + cl + dr;
+    t1 = state[2] + dl + er;
+    t2 = state[3] + el + ar;
+    t3 = state[4] + al + br;
+    t4 = state[0] + bl + cr;
+    state[0] = t0;
+    state[1] = t1;
+    state[2] = t2;
+    state[3] = t3;
+    state[4] = t4;
+}
+
+transmission rmd160_launch {
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+}

@@ -1,0 +1,19 @@
+(* Transmission does not match motor signature *)
+
+motor vector_add_f32 {
+    float* a;
+    float* b;
+    float* c;
+}
+
+transmission bad_pipeline {
+    grid  (1,1,1);
+    block (32,1,1);
+
+    motor vector_add_f32 {
+        in  float* a;
+        in  float* b;
+        out float* c;
+        in  int    n;     // Motor definition does not declare 'n'
+    }
+}

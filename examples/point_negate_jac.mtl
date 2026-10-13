@@ -1,0 +1,86 @@
+// secp256k1 Jacobian point negation: (X1:Y1:Z1) → (X1:-Y1:Z1)
+// Formula: field_negate(Y1)  — 10 carry-chain instructions, branchless.
+//
+// neg_y = (0 - Y1) mod P
+//   Step 1: sub_cc64(0, Y1_i)  × 4  — 256-bit subtract from zero; sets borrow.
+//   Step 2: subc64(0, 0)           — capture borrow bit into sb (0x0 or 0xFFFF...F).
+//   Step 3: ap0 = PL0 & sb         — mask P[0] limb: 0 if no borrow, PL0 if borrow.
+//   Step 4: add_cc64/addc64 × 4    — add-back (P[0] ap0, P[1..3] sb); recovers result.
+//
+// Zero case: 0 - 0 = 0, no borrow, sb = 0, add-back = 0, result = 0. Correct.
+//
+// Register map:
+//   R0..R3   = X1  (locked, not touched)
+//   R4..R7   = Y1  (negated in-place via neg0..neg3 scratch)
+//   R8..R11  = Z1  (locked, not touched)
+//
+// Scratch (stack-allocated, minimal register pressure):
+//   neg0..neg3 = 4-limb scratch for -Y1
+//   sb         = borrow capture
+//   ap0        = PL0 & sb (add-back limb 0)
+//   PL0        = secp256k1 P limb 0 = 0xFFFFFFFEFFFFFC2F
+
+motor point_negate_jac {
+
+    // ── Walker state: X and Z pass through unchanged ─────────────────────────
+    @register(R0)  u64 X1_0; @register(R1)  u64 X1_1;
+    @register(R2)  u64 X1_2; @register(R3)  u64 X1_3;
+    @register(R4)  u64 Y1_0; @register(R5)  u64 Y1_1;
+    @register(R6)  u64 Y1_2; @register(R7)  u64 Y1_3;
+    @register(R8)  u64 Z1_0; @register(R9)  u64 Z1_1;
+    @register(R10) u64 Z1_2; @register(R11) u64 Z1_3;
+
+    // ── Scratch locals ───────────────────────────────────────────────────────
+    u64 neg0; u64 neg1; u64 neg2; u64 neg3;
+    u64 sb; u64 PL0; u64 ap0;
+    PL0 = 0xFFFFFFFEFFFFFC2F;
+
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // field_negate(Y1):  neg_y = (0 - Y1) mod P
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // Step 1: 256-bit subtract from zero (little-endian carry chain)
+    neg0 = sub_cc64(0, Y1_0);
+    neg1 = subc_cc64(0, Y1_1);
+    neg2 = subc_cc64(0, Y1_2);
+    neg3 = subc_cc64(0, Y1_3);
+
+    // Step 2: capture final borrow (0x0 if Y1==0; 0xFFFFFFFFFFFFFFFF if Y1>0)
+    sb  = subc64(0, 0);
+
+    // Step 3: mask P[0] with borrow
+    ap0 = PL0 & sb;
+
+    // Step 4: add-back P*borrow (P[1..3] = 0xFFFF...F = sb when borrow is set)
+    neg0 = add_cc64(neg0, ap0);
+    neg1 = addc_cc64(neg1, sb);
+    neg2 = addc_cc64(neg2, sb);
+    neg3 = addc64(neg3, sb);
+
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Write-back: Y1 <- neg_y; X1 and Z1 are unchanged
+    // ═══════════════════════════════════════════════════════════════════════════
+    Y1_0 = neg0; Y1_1 = neg1; Y1_2 = neg2; Y1_3 = neg3;
+}
+
+
+// ─── Oracle-format transmission ──────────────────────────────────────────────
+// ORACLE FORMAT NOTE: Like point_add_mixed.mtl, this motor operates on
+// virtual registers that are pre-loaded by the surrounding kernel context.
+// The PTX emitted here has no global-memory loads or stores — it is designed
+// to be inlined into a larger kernel (the black-hole scanner), not called as
+// a standalone kernel. The transmission declaration below specifies the
+// register interface contract; ptxas will optimize away the body if assembled
+// alone. SASS-level register verification requires cuobjdump on the enclosing
+// kernel, not on this motor in isolation.
+transmission point_negate_sm89 {
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+    motor point_negate_jac {
+        inout u64 X1_0; inout u64 X1_1; inout u64 X1_2; inout u64 X1_3;
+        inout u64 Y1_0; inout u64 Y1_1; inout u64 Y1_2; inout u64 Y1_3;
+        inout u64 Z1_0; inout u64 Z1_1; inout u64 Z1_2; inout u64 Z1_3;
+    }
+}

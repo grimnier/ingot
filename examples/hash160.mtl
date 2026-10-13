@@ -1,0 +1,153 @@
+// HASH160 = RIPEMD160(SHA256(pubkey))
+// Bitcoin address derivation kernel
+//
+// Two motors chained:
+//   1. sha256_compress  — 64 rounds, 8 working variables
+//   2. ripemd160_compress — 80 rounds, 5 working variables
+//
+// Each motor keeps all working variables in locked physicals across
+// every iteration. Zero register spill. Zero compiler second-guessing.
+//
+// Register layout:
+//   R0  = input data pointer (shared by both motors)
+//   R1  = output hash pointer (shared by both motors)
+//   R2-R9 = SHA256 working variables a,b,c,d,e,f,g,h
+//   R2-R6 = RIPEMD160 working variables a,b,c,d,e (reused after SHA256)
+
+// ── SHA256 Compression Function ─────────────────────────────────────
+// Simplified round function: captures register structure exactly.
+// Full implementation adds Ch(), Maj(), Sigma0(), Sigma1(), round constants.
+// Register contract: R2-R9 hold working state across all 64 rounds.
+
+motor sha256_compress {
+    @register(R0) float* msg;    // 64-word message schedule (W[0..63])
+    @register(R1) float* state;  // 8-word hash state in/out
+
+    // Working variables locked to physical registers
+    // Compiler forbidden from touching R2-R9 inside this motor
+    @register(R2) float a;
+    @register(R3) float b;
+    @register(R4) float c;
+    @register(R5) float d;
+    @register(R6) float e;
+    @register(R7) float f;
+    @register(R8) float g;
+    @register(R9) float h;
+
+    // Load initial state from hash buffer
+    a = state[0];
+    b = state[1];
+    c = state[2];
+    d = state[3];
+    e = state[4];
+    f = state[5];
+    g = state[6];
+    h = state[7];
+
+    // 64 compression rounds
+    // Each round: all 8 vars update based on each other + message word
+    // Full SHA256 adds: Ch(e,f,g), Maj(a,b,c), Sigma0(a), Sigma1(e), K[i]
+    for (int i = 0; i < 64; i = i + 1) {
+        float w;
+        float t1;
+        float t2;
+        w  = msg[i];
+        t1 = h + e + w;
+        t2 = a + b + c;
+        h  = g;
+        g  = f;
+        f  = e;
+        e  = d + t1;
+        d  = c;
+        c  = b;
+        b  = a;
+        a  = t1 + t2;
+    }
+
+    // Add compressed state back to hash buffer
+    state[0] = a + state[0];
+    state[1] = b + state[1];
+    state[2] = c + state[2];
+    state[3] = d + state[3];
+    state[4] = e + state[4];
+    state[5] = f + state[5];
+    state[6] = g + state[6];
+    state[7] = h + state[7];
+}
+
+// ── RIPEMD160 Compression Function ──────────────────────────────────
+// 80 rounds, 5 working variables.
+// Full implementation adds nonlinear functions f1-f5 and round constants.
+// Register contract: R2-R6 hold working state across all 80 rounds.
+
+motor ripemd160_compress {
+    @register(R0) float* msg;    // 16-word message block
+    @register(R1) float* state;  // 5-word hash state in/out
+
+    @register(R2) float a;
+    @register(R3) float b;
+    @register(R4) float c;
+    @register(R5) float d;
+    @register(R6) float e;
+
+    // Load initial state
+    a = state[0];
+    b = state[1];
+    c = state[2];
+    d = state[3];
+    e = state[4];
+
+    // 80 compression rounds
+    // Full RIPEMD160 adds: nonlinear function, bit rotation, round constant
+    for (int i = 0; i < 80; i = i + 1) {
+        float w;
+        float t;
+        w = msg[i];
+        t = a + b + c + w;
+        a = e;
+        e = d;
+        d = c + b;
+        c = b;
+        b = t;
+    }
+
+    // Add back to state
+    state[0] = a + state[0];
+    state[1] = b + state[1];
+    state[2] = c + state[2];
+    state[3] = d + state[3];
+    state[4] = e + state[4];
+}
+
+// ── Transmission Contracts ───────────────────────────────────────────
+
+transmission sha256_launch {
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+    motor sha256_compress {
+        in    R0 float* msg;
+        in    R1 float* state;
+        inout R2 float a;
+        inout R3 float b;
+        inout R4 float c;
+        inout R5 float d;
+        inout R6 float e;
+        inout R7 float f;
+        inout R8 float g;
+        inout R9 float h;
+    }
+}
+
+transmission ripemd160_launch {
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+    motor ripemd160_compress {
+        in    R0 float* msg;
+        in    R1 float* state;
+        inout R2 float a;
+        inout R3 float b;
+        inout R4 float c;
+        inout R5 float d;
+        inout R6 float e;
+    }
+}

@@ -1,0 +1,106 @@
+// hash160_typed_pipeline.mtl
+// Demonstrates rails, target_latches, and route_types (WP8).
+//
+// Pipeline:
+//   Container(2^30 candidates)
+//   → PointRail   (walk motor: advance point, store in candidate_state packet)
+//   → Hash160Latch (hash motor: sha256 → ripemd160 with early-exit prefix check)
+//   → CandidateStatus (route motor: mark LIVE/DEAD/EXACT_HIT, flush dead lanes)
+
+// ── Shared register layout ────────────────────────────────────────────────────
+packet candidate_state {
+    @window(R0..R3)  u64 x[4];
+    @window(R4..R7)  u64 y[4];
+    @register(R8)    u64 y_parity;
+    @register(R9)    u64 route_flags;
+    @register(R10)   u64 candidate_offset;
+}
+
+// ── Rail: range-and-stride keyspace scan ─────────────────────────────────────
+rail PointRail {
+    packet: candidate_state;
+    width:  1073741824;
+    stride: G;
+}
+
+// ── Target latch: staged HASH160 comparison ───────────────────────────────────
+target_latch Hash160Match {
+    target_bytes: 20;
+    compare_at:   [ ripemd_word0, ripemd_word1, ripemd_full ];
+}
+
+// ── Route type: typed candidate states ───────────────────────────────────────
+route_type CandidateStatus {
+    LIVE      = 0;
+    DEAD      = 1;
+    EXACT_HIT = 2;
+}
+
+// ── Motors ───────────────────────────────────────────────────────────────────
+
+motor point_walk {
+    use candidate_state;
+    use PointRail;
+
+    @register(R11) u64 step;
+    @register(R12) u64 tmp;
+
+    step = PointRail_width;
+    tmp  = x[0] + candidate_offset;
+    x[0] = tmp;
+    route_flags = 0;
+}
+
+motor hash160_check {
+    use candidate_state;
+    use Hash160Match;
+    use CandidateStatus;
+
+    @register(R11) u64 partial;
+    @register(R12) u64 matched;
+
+    partial = x[0] ^ x[1] ^ x[2] ^ x[3];
+    matched = partial & 0xFFFFFFFF;
+
+    if (matched == 0) {
+        route_flags = EXACT_HIT;
+    } else {
+        route_flags = DEAD;
+    }
+}
+
+// ── Transmissions ─────────────────────────────────────────────────────────────
+
+transmission walk_kernel {
+    target nvidia.sm_89;
+    profile secp256k1_walk;
+    grid(1073741824, 1, 1);
+    block(256, 1, 1);
+    motor point_walk {
+        packet candidate_state;
+        inout R11 u64 step;
+        inout R12 u64 tmp;
+    }
+}
+
+transmission hash_kernel {
+    target nvidia.sm_89;
+    profile secp256k1_hash;
+    grid(1073741824, 1, 1);
+    block(256, 1, 1);
+    motor hash160_check {
+        packet candidate_state;
+        inout R11 u64 partial;
+        inout R12 u64 matched;
+    }
+}
+
+profile secp256k1_walk {
+    max_registers = 96;
+    spill_allowed = false;
+}
+
+profile secp256k1_hash {
+    max_registers = 96;
+    spill_allowed = false;
+}

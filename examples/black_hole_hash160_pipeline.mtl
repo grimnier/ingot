@@ -1,0 +1,444 @@
+// black_hole_hash160_pipeline.mtl
+//
+// Five-motor HASH160 black-hole pipeline.
+//
+// Architecture:
+//   Motor 1: seed_walker      -- inject starting keys, initialize EC point state
+//   Motor 2: sha256_engine    -- SHA256 of serialized pubkey
+//   Motor 3: bswap_bridge     -- byte-swap SHA256 big-endian -> RIPEMD-160 little-endian
+//   Motor 4: ripemd160_engine -- RIPEMD-160 of bridge output
+//   Motor 5: match_collector  -- prefix check + write hits to output buffer
+//
+// All five transmissions target nvidia.sm_89 and are sealed no-spill.
+// Placeholder bodies: each motor touches its locked registers so ptxas cannot DCE them.
+
+profile black_hole_sm89 {
+    max_registers    = 96;
+    spill_allowed    = false;
+    local_memory_allowed = false;
+}
+
+// ── Motor 1: Seed Walker ──────────────────────────────────────────────────────
+// Reads (x, y) from a keyspace rail, writes serialized pubkey bytes to sha_buf.
+// R0..R3  = affine x limbs (u64 x4)
+// R4..R7  = affine y limbs (u64 x4)
+// R8      = candidate_offset (u64)
+// R9      = sha_buf  (u32* -- 64-word SHA256 message schedule, filled here)
+// R10     = stride   (u64 -- keyspace stride between candidates)
+
+motor seed_walker {
+    @register(R0)  u64 x0;
+    @register(R1)  u64 x1;
+    @register(R2)  u64 x2;
+    @register(R3)  u64 x3;
+    @register(R4)  u64 y0;
+    @register(R5)  u64 y1;
+    @register(R6)  u64 y2;
+    @register(R7)  u64 y3;
+    @register(R8)  u64 candidate_offset;
+    @register(R9)  u32* sha_buf;
+    @register(R10) u64 stride;
+
+    candidate_offset = candidate_offset + stride;
+
+    // Compute prefix: 0x02 if y even, 0x03 if y odd
+    u64 prfx;
+    prfx = (y0 & 1) + 2;
+
+    // Serialize 33-byte compressed pubkey into SHA256 message schedule W[0..15].
+    // x coordinate: x3=MSB limb, x0=LSB limb (each u64 little-endian).
+    // SHA256 expects big-endian u32 words; each word covers 4 consecutive pubkey bytes.
+    //
+    // W[0] = prefix || x3[7..5]     (pubkey bytes  0-3)
+    // W[1] = x3[4..1]               (pubkey bytes  4-7)
+    // W[2] = x3[0] || x2[7..5]      (pubkey bytes  8-11)
+    // W[3] = x2[4..1]               (pubkey bytes 12-15)
+    // W[4] = x2[0] || x1[7..5]      (pubkey bytes 16-19)
+    // W[5] = x1[4..1]               (pubkey bytes 20-23)
+    // W[6] = x1[0] || x0[7..5]      (pubkey bytes 24-27)
+    // W[7] = x0[4..1]               (pubkey bytes 28-31)
+    // W[8] = x0[0] || 0x80 || 0x00 || 0x00  (byte 32 + SHA256 padding sentinel)
+    // W[9..14] = 0x00000000
+    // W[15]  = 264  (message bit length: 33 bytes * 8)
+
+    u64 pw;
+
+    pw = (prfx << 24) | ((x3 >> 40) & 0x00FFFFFF);
+    sha_buf[0] = pw;
+
+    sha_buf[1] = (x3 >> 8) & 0xFFFFFFFF;
+
+    pw = ((x3 & 0xFF) << 24) | ((x2 >> 40) & 0x00FFFFFF);
+    sha_buf[2] = pw;
+
+    sha_buf[3] = (x2 >> 8) & 0xFFFFFFFF;
+
+    pw = ((x2 & 0xFF) << 24) | ((x1 >> 40) & 0x00FFFFFF);
+    sha_buf[4] = pw;
+
+    sha_buf[5] = (x1 >> 8) & 0xFFFFFFFF;
+
+    pw = ((x1 & 0xFF) << 24) | ((x0 >> 40) & 0x00FFFFFF);
+    sha_buf[6] = pw;
+
+    sha_buf[7] = (x0 >> 8) & 0xFFFFFFFF;
+
+    pw = ((x0 & 0xFF) << 24) | 0x00800000;
+    sha_buf[8] = pw;
+
+    sha_buf[9]  = 0;
+    sha_buf[10] = 0;
+    sha_buf[11] = 0;
+    sha_buf[12] = 0;
+    sha_buf[13] = 0;
+    sha_buf[14] = 0;
+    sha_buf[15] = 264;
+
+    // SHA256 schedule expansion: W[i] = sigma1(W[i-2]) + W[i-7] + sigma0(W[i-15]) + W[i-16]
+    // sigma0(x) = rotr7(x)  ^ rotr18(x) ^ shr3(x)
+    // sigma1(x) = rotr17(x) ^ rotr19(x) ^ shr10(x)
+    // Each round reads from sha_buf (already-written indices) and writes to sha_buf[i].
+    for (int i = 16; i < 64; i = i + 1) {
+        int im2;  int im7;  int im15;  int im16;
+        u32 wm2;  u32 wm7;  u32 wm15;  u32 wm16;
+        u32 s0;   u32 s1;   u32 nw;
+        im2  = i - 2;
+        im7  = i - 7;
+        im15 = i - 15;
+        im16 = i - 16;
+        wm2  = sha_buf[im2];
+        wm7  = sha_buf[im7];
+        wm15 = sha_buf[im15];
+        wm16 = sha_buf[im16];
+        s0 = ((wm15 >> 7) | (wm15 << 25)) ^ ((wm15 >> 18) | (wm15 << 14)) ^ (wm15 >> 3);
+        s1 = ((wm2 >> 17) | (wm2 << 15)) ^ ((wm2 >> 19) | (wm2 << 13)) ^ (wm2 >> 10);
+        nw = s1 + wm7 + s0 + wm16;
+        sha_buf[i] = nw;
+    }
+}
+
+transmission seed_walker_tx {
+    target nvidia.sm_89;
+    profile black_hole_sm89;
+    require no_spills;
+    require no_local_memory;
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor seed_walker {
+        inout R0  u64 x0;
+        inout R1  u64 x1;
+        inout R2  u64 x2;
+        inout R3  u64 x3;
+        inout R4  u64 y0;
+        inout R5  u64 y1;
+        inout R6  u64 y2;
+        inout R7  u64 y3;
+        inout R8  u64 candidate_offset;
+        inout R9  u32* sha_buf;
+        in    R10 u64 stride;
+    }
+}
+
+// ── Motor 2: SHA256 Engine ────────────────────────────────────────────────────
+// Compresses the 33-byte pubkey message schedule in sha_buf.
+// R0 = sha_buf (u32* in/out), R1 = sha_state (u32* inout), R2 = sha_k (u32*)
+// R3..R10 = a, b, c, d, e, f, g, h
+
+motor sha256_bh {
+    @register(R0)  u32* sha_buf;
+    @register(R1)  u32* sha_state;
+    @register(R2)  u32* sha_k;
+    @register(R3)  u32 a;
+    @register(R4)  u32 b;
+    @register(R5)  u32 c;
+    @register(R6)  u32 d;
+    @register(R7)  u32 e;
+    @register(R8)  u32 f;
+    @register(R9)  u32 g;
+    @register(R10) u32 h;
+
+    a = sha_state[0];
+    b = sha_state[1];
+    c = sha_state[2];
+    d = sha_state[3];
+    e = sha_state[4];
+    f = sha_state[5];
+    g = sha_state[6];
+    h = sha_state[7];
+
+    for (int i = 0; i < 64; i = i + 1) {
+        u32 w;
+        u32 ki;
+        u32 s1;
+        u32 ch;
+        u32 t1;
+        u32 s0;
+        u32 ma;
+        u32 t2;
+        w  = sha_buf[i];
+        ki = sha_k[i];
+        s1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+        ch = (e & f) ^ (~e & g);
+        t1 = h + s1 + ch + ki + w;
+        s0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+        ma = (a & b) ^ (a & c) ^ (b & c);
+        t2 = s0 + ma;
+        h  = g; g  = f; f  = e; e  = d + t1;
+        d  = c; c  = b; b  = a; a  = t1 + t2;
+    }
+
+    sha_state[0] = a + sha_state[0];
+    sha_state[1] = b + sha_state[1];
+    sha_state[2] = c + sha_state[2];
+    sha_state[3] = d + sha_state[3];
+    sha_state[4] = e + sha_state[4];
+    sha_state[5] = f + sha_state[5];
+    sha_state[6] = g + sha_state[6];
+    sha_state[7] = h + sha_state[7];
+}
+
+transmission sha256_bh_tx {
+    target nvidia.sm_89;
+    profile black_hole_sm89;
+    require no_spills;
+    require no_local_memory;
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor sha256_bh {
+        in    R0 u32* sha_buf;
+        inout R1 u32* sha_state;
+        in    R2 u32* sha_k;
+        inout R3  u32 a;
+        inout R4  u32 b;
+        inout R5  u32 c;
+        inout R6  u32 d;
+        inout R7  u32 e;
+        inout R8  u32 f;
+        inout R9  u32 g;
+        inout R10 u32 h;
+    }
+}
+
+// ── Motor 3: Byte-Swap Bridge ─────────────────────────────────────────────────
+// Converts SHA256 big-endian u32 output to RIPEMD-160 little-endian input.
+// R0 = sha_state (u32* in), R1 = rmd_buf (u32* out -- 16 little-endian words)
+
+motor bswap_bridge {
+    @register(R0) u32* sha_state;
+    @register(R1) u32* rmd_buf;
+
+    u32 bm1;
+    u32 bm2;
+    u32 bw;
+    u32 b0;
+    u32 b1;
+    u32 b2;
+    u32 b3;
+    bm1 = 0x0000FF00;
+    bm2 = 0x00FF0000;
+
+    bw = sha_state[0];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[0] = b0 | b1 | b2 | b3;
+
+    bw = sha_state[1];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[1] = b0 | b1 | b2 | b3;
+
+    bw = sha_state[2];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[2] = b0 | b1 | b2 | b3;
+
+    bw = sha_state[3];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[3] = b0 | b1 | b2 | b3;
+
+    bw = sha_state[4];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[4] = b0 | b1 | b2 | b3;
+
+    bw = sha_state[5];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[5] = b0 | b1 | b2 | b3;
+
+    bw = sha_state[6];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[6] = b0 | b1 | b2 | b3;
+
+    bw = sha_state[7];
+    b0 = bw >> 24; b1 = (bw >> 8) & bm1; b2 = (bw << 8) & bm2; b3 = bw << 24;
+    rmd_buf[7] = b0 | b1 | b2 | b3;
+
+    u32 bpad;
+    u32 blen;
+    u32 bzero;
+    bpad = 0x00000080;
+    blen = 0x00000100;
+    bzero = 0;
+    rmd_buf[8]  = bpad;
+    rmd_buf[9]  = bzero;
+    rmd_buf[10] = bzero;
+    rmd_buf[11] = bzero;
+    rmd_buf[12] = bzero;
+    rmd_buf[13] = bzero;
+    rmd_buf[14] = blen;
+    rmd_buf[15] = bzero;
+}
+
+transmission bswap_bridge_tx {
+    target nvidia.sm_89;
+    profile black_hole_sm89;
+    require no_spills;
+    require no_local_memory;
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor bswap_bridge {
+        in  R0 u32* sha_state;
+        out R1 u32* rmd_buf;
+    }
+}
+
+// ── Motor 4: RIPEMD-160 Engine ────────────────────────────────────────────────
+// Two parallel 80-round tracks, combined at end.
+// R0 = rmd_buf (u32*), R1 = rmd_state (u32* inout)
+// R2..R6 = rl, rr, sl, sr, kl  (lookup tables)
+// R7 = kr, R8..R12 = al..el, R13..R17 = ar..er
+
+motor ripemd160_bh {
+    @register(R0)  u32* rmd_buf;
+    @register(R1)  u32* rmd_state;
+    @register(R2)  u32* rl;
+    @register(R3)  u32* rr;
+    @register(R4)  u32* sl;
+    @register(R5)  u32* sr;
+    @register(R6)  u32* kl;
+    @register(R7)  u32* kr;
+    @register(R8)  u32 al;
+    @register(R9)  u32 bl;
+    @register(R10) u32 cl;
+    @register(R11) u32 dl;
+    @register(R12) u32 el;
+    @register(R13) u32 ar;
+    @register(R14) u32 br;
+    @register(R15) u32 cr;
+    @register(R16) u32 dr;
+    @register(R17) u32 er;
+
+    al = rmd_state[0]; bl = rmd_state[1]; cl = rmd_state[2]; dl = rmd_state[3]; el = rmd_state[4];
+    ar = rmd_state[0]; br = rmd_state[1]; cr = rmd_state[2]; dr = rmd_state[3]; er = rmd_state[4];
+
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f; u32 idx; u32 w; u32 s; u32 ki; u32 tval; u32 n32; u32 inv_s; u32 tmp;
+        if (j < 16) { f = bl ^ cl ^ dl; } else {
+            if (j < 32) { f = (bl & cl) | (~bl & dl); } else {
+                if (j < 48) { f = (bl | ~cl) ^ dl; } else {
+                    if (j < 64) { f = (bl & dl) | (cl & ~dl); } else { f = bl ^ (cl | ~dl); }
+                }
+            }
+        }
+        idx = rl[j]; w = rmd_buf[idx]; s = sl[j]; ki = kl[j];
+        tval = al + f + w + ki; n32 = 32; inv_s = n32 - s;
+        tmp = (tval << s) | (tval >> inv_s); tval = tmp + el;
+        al = el; el = dl; tmp = (cl << 10) | (cl >> 22); dl = tmp; cl = bl; bl = tval;
+    }
+
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f; u32 idx; u32 w; u32 s; u32 ki; u32 tval; u32 n32; u32 inv_s; u32 tmp;
+        if (j < 16) { f = br ^ (cr | ~dr); } else {
+            if (j < 32) { f = (br & dr) | (cr & ~dr); } else {
+                if (j < 48) { f = (br | ~cr) ^ dr; } else {
+                    if (j < 64) { f = (br & cr) | (~br & dr); } else { f = br ^ cr ^ dr; }
+                }
+            }
+        }
+        idx = rr[j]; w = rmd_buf[idx]; s = sr[j]; ki = kr[j];
+        tval = ar + f + w + ki; n32 = 32; inv_s = n32 - s;
+        tmp = (tval << s) | (tval >> inv_s); tval = tmp + er;
+        ar = er; er = dr; tmp = (cr << 10) | (cr >> 22); dr = tmp; cr = br; br = tval;
+    }
+
+    u32 t0; u32 t1; u32 t2; u32 t3; u32 t4;
+    t0 = rmd_state[1] + cl + dr;
+    t1 = rmd_state[2] + dl + er;
+    t2 = rmd_state[3] + el + ar;
+    t3 = rmd_state[4] + al + br;
+    t4 = rmd_state[0] + bl + cr;
+    rmd_state[0] = t0; rmd_state[1] = t1; rmd_state[2] = t2;
+    rmd_state[3] = t3; rmd_state[4] = t4;
+}
+
+transmission ripemd160_bh_tx {
+    target nvidia.sm_89;
+    profile black_hole_sm89;
+    require no_spills;
+    require no_local_memory;
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor ripemd160_bh {
+        in    R0 u32* rmd_buf;
+        inout R1 u32* rmd_state;
+        in    R2 u32* rl;
+        in    R3 u32* rr;
+        in    R4 u32* sl;
+        in    R5 u32* sr;
+        in    R6 u32* kl;
+        in    R7 u32* kr;
+        inout R8  u32 al; inout R9  u32 bl; inout R10 u32 cl;
+        inout R11 u32 dl; inout R12 u32 el;
+        inout R13 u32 ar; inout R14 u32 br; inout R15 u32 cr;
+        inout R16 u32 dr; inout R17 u32 er;
+    }
+}
+
+// ── Motor 5: Match Collector ──────────────────────────────────────────────────
+// Compares the 5-word RIPEMD-160 output against target_hash160.
+// On match: writes candidate_offset to hits buffer at atomic position.
+// R0 = rmd_state (u32*), R1 = target (u32*), R2 = hits (u64*), R3 = hit_count (u64*)
+// R4 = candidate_offset (u64)
+
+motor match_collector {
+    @register(R0) u32* rmd_state;
+    @register(R1) u32* tgt;
+    @register(R2) u64* hits;
+    @register(R3) u64* hit_count;
+    @register(R4) u64 candidate_offset;
+
+    u32 w0;
+    u32 w1;
+    u32 w2;
+    u32 w3;
+    u32 w4;
+    u32 t0;
+    u32 t1;
+    u32 t2;
+    u32 t3;
+    u32 t4;
+    u32 match;
+
+    w0 = rmd_state[0]; w1 = rmd_state[1]; w2 = rmd_state[2];
+    w3 = rmd_state[3]; w4 = rmd_state[4];
+    t0 = tgt[0];    t1 = tgt[1];    t2 = tgt[2];
+    t3 = tgt[3];    t4 = tgt[4];
+
+    match = (w0 ^ t0) | (w1 ^ t1) | (w2 ^ t2) | (w3 ^ t3) | (w4 ^ t4);
+
+    if (match == 0) {
+        hits[0] = candidate_offset;
+    }
+}
+
+transmission match_collector_tx {
+    target nvidia.sm_89;
+    profile black_hole_sm89;
+    require no_spills;
+    require no_local_memory;
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor match_collector {
+        in    R0 u32* rmd_state;
+        in    R1 u32* tgt;
+        out   R2 u64* hits;
+        inout R3 u64* hit_count;
+        in    R4 u64 candidate_offset;
+    }
+}

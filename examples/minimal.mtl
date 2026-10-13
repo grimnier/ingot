@@ -1,0 +1,25 @@
+// The absolute simplest Ingot program you can write right now.
+// This is the closest thing to "Hello World" in this language.
+
+// A motor is pure compute. It can only do math and memory access.
+// It cannot print text. Output goes into memory buffers.
+
+motor minimal {
+    @register(R0) float* input;
+    @register(R1) float* output;
+
+    // Take the first value from input and add 1.0 to it
+    float value = input[0];
+    output[0] = value + 1.0;
+}
+
+// The transmission tells the GPU how to launch this and what data to pass.
+transmission minimal_launch {
+    grid (1, 1, 1);
+    block (1, 1, 1);
+
+    motor minimal {
+        in  float* input;
+        out float* output;
+    }
+}

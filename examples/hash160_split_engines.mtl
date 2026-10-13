@@ -1,0 +1,111 @@
+// hash160_split_engines.mtl
+//
+// Two sealed motors compiled into one PTX cubin via `ingotc --all-kernels`.
+// The host launches them back-to-back in a CUDA graph or sequential stream:
+//
+//   1. point_walk_tx  — advances walkers, accumulates the batch-inversion Z rail,
+//                       then normalizes to affine (X, Y) and writes y_parity.
+//   2. hash160_tx     — reads (X, y_parity), computes SHA256(RIPEMD160(...)) and
+//                       compares against a target.  Writes match flags.
+//
+// Register budget: both kernels target ≤ 96 registers so the GPU can schedule
+// 2 blocks/SM at 256 threads/block on Ada Lovelace (sm_89).
+
+// ── Sealed profile ─────────────────────────────────────────────────────────────
+
+profile hash160_sealed_sm89 {
+    max_registers     = 96;
+    spill_allowed     = false;
+    local_memory_allowed = false;
+}
+
+// ══ Engine A: point walk + batch-inversion normalize ═══════════════════════════
+//
+// Register map:
+//   R0..R3   affine x limbs (output: normalized X after inversion)
+//   R4..R7   affine y limbs (output: normalized Y after inversion)
+//   R8..R11  jacobian Z limbs (scratch during inversion; zeroed on handoff)
+//   R12..R15 tmp_a — scratch for field-multiply carry chain
+//   R16..R19 tmp_b — scratch for second field-multiply leg
+//   R20      y_parity (bit 0 of normalized Y; written to handoff rail)
+//   R21      candidate_offset (position in keyspace batch)
+
+motor point_walk_normalize {
+    @window(R0..R3)   u64 aff_x[4];
+    @window(R4..R7)   u64 aff_y[4];
+    @window(R8..R11)  u64 jac_z[4];
+    @window(R12..R15) u64 tmp_a[4];
+    @window(R16..R19) u64 tmp_b[4];
+
+    @register(R20) u64 y_parity;
+    @register(R21) u64 candidate_offset;
+
+    // Placeholder body — touches all windows so ptxas cannot DCE them.
+    // Real body: affine hop → Z-rail accumulation → syncthreads → batch inversion.
+    tmp_a[0] = aff_x[0] + aff_y[0];
+    tmp_b[0] = aff_x[1] + jac_z[0];
+    y_parity = tmp_a[0] + candidate_offset;
+}
+
+transmission point_walk_tx {
+    target nvidia.sm_89;
+    profile hash160_sealed_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(96);
+    motor point_walk_normalize {
+        inout registers(R0..R3)   u64 aff_x;
+        inout registers(R4..R7)   u64 aff_y;
+        inout registers(R8..R11)  u64 jac_z;
+        inout registers(R12..R15) u64 tmp_a;
+        inout registers(R16..R19) u64 tmp_b;
+        inout R20 u64 y_parity;
+        inout R21 u64 candidate_offset;
+    }
+}
+
+// ══ Engine B: HASH160 compress + compare ══════════════════════════════════════
+//
+// Register map:
+//   R0..R3   affine X limbs (read from point_walk output rail)
+//   R4       y_parity (u32, read from point_walk output rail)
+//   R5..R8   SHA256 working variables a..d
+//   R9..R12  SHA256 working variables e..h
+//   R13..R20 SHA256 message schedule W[0..7]
+//   R21      RIPEMD160 accumulator scratch
+//
+// Each register window here is independent of Engine A — they compile to
+// separate .entry blocks and never share live registers across launch boundaries.
+
+motor hash160_compare {
+    @window(R0..R3)  u64 x_limbs[4];
+    @register(R4)    u64 y_par;
+
+    // SHA256 working variables (8 × u64 holding u32 pair-packed or full u64 lanes)
+    @window(R5..R12)  u64 sha_abcdefgh[8];
+
+    // Partial message schedule (8 slots; real kernel would use 64)
+    @window(R13..R20) u64 sha_w[8];
+
+    @register(R21) u64 rmd_acc;
+
+    // Placeholder — prevent DCE
+    sha_abcdefgh[0] = x_limbs[0] + y_par;
+    sha_w[0]        = x_limbs[1] + sha_abcdefgh[0];
+    rmd_acc         = sha_w[0] + sha_abcdefgh[1];
+}
+
+transmission hash160_tx {
+    target nvidia.sm_89;
+    profile hash160_sealed_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(96);
+    motor hash160_compare {
+        inout registers(R0..R3)   u64 x_limbs;
+        inout R4                  u64 y_par;
+        inout registers(R5..R12)  u64 sha_abcdefgh;
+        inout registers(R13..R20) u64 sha_w;
+        inout R21                 u64 rmd_acc;
+    }
+}

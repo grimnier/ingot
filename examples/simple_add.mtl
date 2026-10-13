@@ -1,0 +1,22 @@
+// Minimal real kernel that exercises the full pipeline:
+// locked registers + local computation + store.
+
+motor simple_add {
+    @register(R0) float* a;
+    @register(R1) float* b;
+    @register(R2) float* c;
+
+    float va = a[0];
+    float vb = b[0];
+    c[0] = va + vb;
+}
+
+transmission simple_add_launch {
+    grid (1, 1, 1);
+    block (1, 1, 1);
+    motor simple_add {
+        in  float* a;
+        in  float* b;
+        out float* c;
+    }
+}

@@ -1,0 +1,53 @@
+// secp256k1 field addition: r = a + b  mod P
+// P = 2^256 - 2^32 - 977
+// P64 = [0xFFFFFFFEFFFFFC2F, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF]
+//
+// Register layout (8 limbs locked):
+//   R0-R3 = a[0..3]  (input/output)
+//   R4-R7 = b[0..3]  (input)
+
+motor fe_add {
+    @register(R0) u64 a0;
+    @register(R1) u64 a1;
+    @register(R2) u64 a2;
+    @register(R3) u64 a3;
+    @register(R4) u64 b0;
+    @register(R5) u64 b1;
+    @register(R6) u64 b2;
+    @register(R7) u64 b3;
+
+    // Step 1: 4-limb add with carry chain
+    u64 r0; u64 r1; u64 r2; u64 r3; u64 carry;
+    r0    = add_cc64(a0, b0);
+    r1    = addc_cc64(a1, b1);
+    r2    = addc_cc64(a2, b2);
+    r3    = addc_cc64(a3, b3);
+    carry = addc64(0, 0);
+
+    // Step 2: try subtracting P (branchless conditional reduction)
+    // P = [0xFFFFFFFEFFFFFC2F, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF]
+    u64 s0; u64 s1; u64 s2; u64 s3; u64 borrow;
+    s0     = sub_cc64(r0, 0xFFFFFFFEFFFFFC2F);
+    s1     = subc_cc64(r1, 0xFFFFFFFFFFFFFFFF);
+    s2     = subc_cc64(r2, 0xFFFFFFFFFFFFFFFF);
+    s3     = subc_cc64(r3, 0xFFFFFFFFFFFFFFFF);
+    borrow = subc64(carry, 0);
+
+    // borrow = 0xFFFFFFFFFFFFFFFF when r+carry < P  (keep r)
+    //        = 0                  when r+carry >= P (use s)
+    u64 nborrow;
+    nborrow = ~borrow;
+    a0 = (r0 & borrow) | (s0 & nborrow);
+    a1 = (r1 & borrow) | (s1 & nborrow);
+    a2 = (r2 & borrow) | (s2 & nborrow);
+    a3 = (r3 & borrow) | (s3 & nborrow);
+}
+
+transmission fe_add_bench {
+    grid (256, 1, 1);
+    block (256, 1, 1);
+    motor fe_add {
+        inout u64 a0; inout u64 a1; inout u64 a2; inout u64 a3;
+        in    u64 b0; in    u64 b1; in    u64 b2; in    u64 b3;
+    }
+}

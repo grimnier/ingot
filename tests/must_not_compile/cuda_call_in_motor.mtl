@@ -1,0 +1,6 @@
+(* This must be rejected: CUDA runtime calls inside a motor block *)
+
+motor bad_cuda_call {
+    // ERROR: cudaMemcpy is not allowed inside a motor
+    cudaMemcpy(d_out, d_in, size, cudaMemcpyDeviceToDevice);
+}

@@ -1,0 +1,77 @@
+// Toy version of Pollard's Rho factorization for small numbers (fits in u64)
+// This is a simplified, bounded implementation for learning Ingot.
+//
+// Real Pollard's Rho is used for large integers. This version is only for
+// educational purposes on numbers that fit in 64 bits.
+
+motor pollard_rho {
+    // These are the "ports" coming from the transmission.
+    // They must be declared with @register inside the motor.
+    @register(R0) u64* n_in;       // the number we want to factor
+    @register(R1) u64* factor_out; // result: a non-trivial factor, or 0 on failure
+
+    u64 n = n_in[0];
+
+    // Starting values (classic choice for Pollard's Rho)
+    u64 x = 2;
+    u64 y = 2;
+    u64 d = 1;
+
+    // We bound the number of outer iterations because true data-dependent
+    // unbounded while loops are still being hardened.
+    int max_outer = 100000;
+
+    for (int iter = 0; iter < max_outer; iter = iter + 1) {
+
+        // === x = g(x)   where g(z) = (z*z + 1) mod n ===
+        u64 xsq = x * x;
+        x = (xsq + 1) % n;
+
+        // === y = g(g(y)) ===
+        u64 y1 = (y * y + 1) % n;
+        y = (y1 * y1 + 1) % n;
+
+        // === d = gcd( |x-y|, n ) ===
+        u64 diff;
+        if (x > y) {
+            diff = x - y;
+        } else {
+            diff = y - x;
+        }
+
+        // Inlined Euclidean algorithm (bounded to avoid infinite loop risk)
+        u64 aa = diff;
+        u64 bb = n;
+        int gcd_max_steps = 1000;
+        for (int gstep = 0; gstep < gcd_max_steps; gstep = gstep + 1) {
+            if (bb == 0) {
+                d = aa;
+                break;
+            }
+            u64 temp = bb;
+            bb = aa % bb;
+            aa = temp;
+        }
+
+        if (d != 1) {
+            // Found something — we can break early in spirit.
+            // For now we just let the outer loop continue (it will finish).
+        }
+    }
+
+    // Decision
+    if (d > 1 && d < n) {
+        factor_out[0] = d;   // Success: non-trivial factor found
+    } else {
+        factor_out[0] = 0;   // Failure or we hit the iteration limit
+    }
+}
+
+// The transmission declares how this motor should be launched on the GPU.
+transmission pollard_rho_launch {
+    grid (1, 1, 1);
+    block (1, 1, 1);
+
+    // No detailed motor contract for now — keeps the semantic checker happy
+    // in the current state of the language.
+}

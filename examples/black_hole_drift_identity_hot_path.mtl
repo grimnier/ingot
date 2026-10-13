@@ -1,0 +1,109 @@
+// black_hole_drift_identity_hot_path.mtl
+//
+// Replaces the loose curve symbol:
+//   Q = AG + sum(2^eG) + zG
+//
+// with a language-owned drift identity:
+//   Q = AnchorQ(A)
+//     + DyadicDrift(mask)
+//     + TailDrift(z)
+//     + PhaseDrift(packet_cell, local_offset, hex_phase)
+//
+// Compiler/runtime rule for this rail:
+//   No raw G in the hot path. Only named drift operators are allowed.
+//
+// This file is intentionally the packet/label/Q-contract lane, not the full
+// secp256k1 verifier. The verifier remains a downstream exact latch.
+
+profile drift_identity_hot_path_sm89 {
+    max_registers        = 64;
+    spill_allowed        = false;
+    local_memory_allowed = false;
+}
+
+motor drift_identity_hot_path {
+    // Packet identity inputs.
+    @register(R0)  u64 anchor_q_lo;
+    @register(R1)  u64 dyadic_mask;
+    @register(R2)  u64 tail_z_abs;
+    @register(R3)  u64 packet_cell;
+    @register(R4)  u64 packet_span;
+    @register(R5)  u64 local_offset;
+    @register(R6)  u64 percent_phase8;
+    @register(R7)  u64 hex_phase;
+    @register(R8)  u64 candidates_per_packet;
+
+    // Named drift operators. These are not raw G calls; they are language
+    // transmission lanes that can later lower to precomputed point deltas.
+    @register(R9)  u64 anchor_drift;
+    @register(R10) u64 dyadic_drift;
+    @register(R11) u64 tail_drift;
+    @register(R12) u64 phase_drift;
+    @register(R13) u64 local_drift;
+
+    // Output contract labels.
+    @register(R14) u64 q_contract_lo;
+    @register(R15) u64 packet_q_contracts;
+    @register(R16) u64 candidate_compare_contracts;
+    @register(R17) u64 route_flags;
+    @register(R18) u64 acc;
+
+    // AnchorQ(A): the packet family base.
+    anchor_drift = anchor_q_lo;
+
+    // DyadicDrift(mask): exact dyadic edge expansion label.
+    dyadic_drift = dyadic_mask & 0xFFFFFFFFFFFFFFFF;
+
+    // TailDrift(z): signed side rail magnitude, already absolute here.
+    tail_drift = tail_z_abs;
+
+    // PhaseDrift: bounded phase geometry from percent/hex chambers.
+    phase_drift = (percent_phase8 << 4) | (hex_phase & 15);
+
+    // LocalDrift: packet-local integer movement.
+    local_drift = (packet_cell * packet_span) + local_offset;
+
+    // Transmission identity. This is the replacement for raw G in the hot path.
+    q_contract_lo = anchor_drift ^ dyadic_drift;
+    q_contract_lo = q_contract_lo ^ tail_drift;
+    q_contract_lo = q_contract_lo ^ phase_drift;
+    q_contract_lo = q_contract_lo ^ local_drift;
+
+    packet_q_contracts = candidates_per_packet;
+    candidate_compare_contracts = candidates_per_packet;
+
+    // Route flags: bit 0 = drift identity formed, bit 1 = compare slots emitted.
+    // This rail is only launched when candidates_per_packet is nonzero.
+    route_flags = 3;
+
+    acc = q_contract_lo ^ (packet_q_contracts << 24) ^ (route_flags << 48);
+}
+
+transmission drift_identity_hot_path_tx {
+    target nvidia.sm_89;
+    profile drift_identity_hot_path_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(64);
+    motor drift_identity_hot_path {
+        inout R0  u64 anchor_q_lo;
+        inout R1  u64 dyadic_mask;
+        inout R2  u64 tail_z_abs;
+        inout R3  u64 packet_cell;
+        inout R4  u64 packet_span;
+        inout R5  u64 local_offset;
+        inout R6  u64 percent_phase8;
+        inout R7  u64 hex_phase;
+        inout R8  u64 candidates_per_packet;
+        inout R9  u64 anchor_drift;
+        inout R10 u64 dyadic_drift;
+        inout R11 u64 tail_drift;
+        inout R12 u64 phase_drift;
+        inout R13 u64 local_drift;
+        inout R14 u64 q_contract_lo;
+        inout R15 u64 packet_q_contracts;
+        inout R16 u64 candidate_compare_contracts;
+        inout R17 u64 route_flags;
+        inout R18 u64 acc;
+    }
+}

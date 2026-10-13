@@ -1,0 +1,43 @@
+// r1_teleological_attractor.mtl -- WP9 Teleological Neural Motor
+// Pins output attractor token (e.g. 'y' / 15) and evaluates candidate resonance
+// directly on NVIDIA sm_89 hardware registers with zero local memory spilling.
+
+attractor BinaryAnswerAttractor {
+    pin: [129280, 15, 100]; // EOS, 'y', 'n'
+    threshold: 0.85;
+    exit_on_hit: true;
+}
+
+manifold R1UnembeddingManifold {
+    tensor hidden_state : f32   @align(16);
+    tensor unemb_matrix : q6_k  @align(16);
+    tensor logits_out   : f32   @align(16);
+}
+
+motor teleological_candidate_eval {
+    use BinaryAnswerAttractor;
+    use R1UnembeddingManifold;
+
+    @register(R0) float* hidden_state;
+    @register(R1) q6_k*  unemb_matrix;
+    @register(R2) float* logits_out;
+
+    u64 target_tok;
+    float thresh;
+    target_tok = BinaryAnswerAttractor_target;
+    thresh = BinaryAnswerAttractor_threshold;
+
+    int gid;
+    gid = blockIdx.x * blockDim.x + threadIdx.x;
+    logits_out[gid] = hidden_state[gid] * thresh;
+}
+
+transmission teleological_eval_launch {
+    grid (1, 1, 1);
+    block (256, 1, 1);
+    motor teleological_candidate_eval {
+        in    float* hidden_state @align(16);
+        in    q6_k*  unemb_matrix @align(16);
+        inout float* logits_out   @align(16);
+    }
+}

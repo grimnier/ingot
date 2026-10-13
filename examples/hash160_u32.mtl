@@ -1,0 +1,330 @@
+// HASH160 = RIPEMD160(SHA256(msg)) — full u32 pipeline in one motor
+//
+// Phase 1: SHA256 compression  (R3-R10 hold a-h)
+// Phase 2: byte-swap bridge    (big-endian SHA256 → little-endian RIPEMD160 input)
+// Phase 3: RIPEMD160 two-track (R19-R28 hold al-el, ar-er)
+//
+// Register layout:
+//   R0  = sha_msg   (u32* 64  — SHA256 message schedule W[0..63])
+//   R1  = sha_state (u32* 8   — SHA256 initial H0 in, SHA256 output out)
+//   R2  = sha_k     (u32* 64  — SHA256 round constants)
+//   R3  = a   SHA256 working var
+//   R4  = b
+//   R5  = c
+//   R6  = d
+//   R7  = e
+//   R8  = f
+//   R9  = g
+//   R10 = h
+//   R11 = tmp       (u32* 16  — bridge buffer: byte-swapped SHA256 → RIPEMD160 msg)
+//   R12 = rmd_state (u32* 5   — RIPEMD160 initial H0 in, RIPEMD160 output out)
+//   R13 = rmd_rl    (u32* 80)
+//   R14 = rmd_rr    (u32* 80)
+//   R15 = rmd_sl    (u32* 80)
+//   R16 = rmd_sr    (u32* 80)
+//   R17 = rmd_kl    (u32* 80)
+//   R18 = rmd_kr    (u32* 80)
+//   R19-R23 = al,bl,cl,dl,el  (RIPEMD160 left track)
+//   R24-R28 = ar,br,cr,dr,er  (RIPEMD160 right track)
+
+motor hash160_u32 {
+    @register(R0)  u32* sha_msg;
+    @register(R1)  u32* sha_state;
+    @register(R2)  u32* sha_k;
+    @register(R3)  u32 a;
+    @register(R4)  u32 b;
+    @register(R5)  u32 c;
+    @register(R6)  u32 d;
+    @register(R7)  u32 e;
+    @register(R8)  u32 f;
+    @register(R9)  u32 g;
+    @register(R10) u32 h;
+    @register(R11) u32* tmp;
+    @register(R12) u32* rmd_state;
+    @register(R13) u32* rmd_rl;
+    @register(R14) u32* rmd_rr;
+    @register(R15) u32* rmd_sl;
+    @register(R16) u32* rmd_sr;
+    @register(R17) u32* rmd_kl;
+    @register(R18) u32* rmd_kr;
+    @register(R19) u32 al;
+    @register(R20) u32 bl;
+    @register(R21) u32 cl;
+    @register(R22) u32 dl;
+    @register(R23) u32 el;
+    @register(R24) u32 ar;
+    @register(R25) u32 br;
+    @register(R26) u32 cr;
+    @register(R27) u32 dr;
+    @register(R28) u32 er;
+
+    // ── Phase 1: SHA256 compression ─────────────────────────────────────────
+    a = sha_state[0];
+    b = sha_state[1];
+    c = sha_state[2];
+    d = sha_state[3];
+    e = sha_state[4];
+    f = sha_state[5];
+    g = sha_state[6];
+    h = sha_state[7];
+
+    for (int i = 0; i < 64; i = i + 1) {
+        u32 w;
+        u32 ki;
+        u32 s1;
+        u32 ch;
+        u32 t1;
+        u32 s0;
+        u32 ma;
+        u32 t2;
+        w  = sha_msg[i];
+        ki = sha_k[i];
+        s1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+        ch = lop3(e, f, g, 0xCA);
+        t1 = h + s1 + ch + ki + w;
+        s0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+        ma = lop3(a, b, c, 0xE8);
+        t2 = s0 + ma;
+        h  = g;
+        g  = f;
+        f  = e;
+        e  = d + t1;
+        d  = c;
+        c  = b;
+        b  = a;
+        a  = t1 + t2;
+    }
+
+    sha_state[0] = a + sha_state[0];
+    sha_state[1] = b + sha_state[1];
+    sha_state[2] = c + sha_state[2];
+    sha_state[3] = d + sha_state[3];
+    sha_state[4] = e + sha_state[4];
+    sha_state[5] = f + sha_state[5];
+    sha_state[6] = g + sha_state[6];
+    sha_state[7] = h + sha_state[7];
+
+    // ── Phase 2: byte-swap bridge ────────────────────────────────────────────
+    // SHA256 outputs big-endian u32; RIPEMD160 expects little-endian u32.
+    // bswap32(x) = (x>>24) | ((x>>8)&0x0000FF00) | ((x<<8)&0x00FF0000) | (x<<24)
+    // Pad the 32-byte (8-word) SHA256 result to a 64-byte RIPEMD160 input block:
+    //   tmp[0..7]  = bswap32(sha_state[0..7])
+    //   tmp[8]     = 0x00000080  (pad byte 0x80 at position 32)
+    //   tmp[9..13] = 0
+    //   tmp[14]    = 0x00000100  (length = 256 bits, little-endian)
+    //   tmp[15]    = 0
+    u32 bm1;
+    u32 bm2;
+    u32 bb0;
+    u32 bb1;
+    u32 bb2;
+    u32 bb3;
+    u32 bw;
+    u32 bzero;
+    bm1   = 0x0000FF00;
+    bm2   = 0x00FF0000;
+    bzero = 0;
+
+    bw = sha_state[0];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[0] = bw;
+
+    bw = sha_state[1];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[1] = bw;
+
+    bw = sha_state[2];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[2] = bw;
+
+    bw = sha_state[3];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[3] = bw;
+
+    bw = sha_state[4];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[4] = bw;
+
+    bw = sha_state[5];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[5] = bw;
+
+    bw = sha_state[6];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[6] = bw;
+
+    bw = sha_state[7];
+    bb0 = bw >> 24;
+    bb1 = (bw >> 8) & bm1;
+    bb2 = (bw << 8) & bm2;
+    bb3 = bw << 24;
+    bw  = bb0 | bb1 | bb2 | bb3;
+    tmp[7] = bw;
+
+    u32 bpad;
+    u32 blen;
+    bpad    = 0x00000080;
+    blen    = 0x00000100;
+    tmp[8]  = bpad;
+    tmp[9]  = bzero;
+    tmp[10] = bzero;
+    tmp[11] = bzero;
+    tmp[12] = bzero;
+    tmp[13] = bzero;
+    tmp[14] = blen;
+    tmp[15] = bzero;
+
+    // ── Phase 3: RIPEMD160 two-track compression ─────────────────────────────
+    al = rmd_state[0];
+    bl = rmd_state[1];
+    cl = rmd_state[2];
+    dl = rmd_state[3];
+    el = rmd_state[4];
+    ar = rmd_state[0];
+    br = rmd_state[1];
+    cr = rmd_state[2];
+    dr = rmd_state[3];
+    er = rmd_state[4];
+
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f;
+        u32 idx;
+        u32 wmsg;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp2;
+
+        if (j < 16) {
+            f = lop3(bl, cl, dl, 0x96);
+        } else {
+            if (j < 32) {
+                f = lop3(bl, cl, dl, 0xCA);
+            } else {
+                if (j < 48) {
+                    f = lop3(bl, cl, dl, 0x59);
+                } else {
+                    if (j < 64) {
+                        f = lop3(bl, cl, dl, 0xE4);
+                    } else {
+                        f = lop3(bl, cl, dl, 0x2D);
+                    }
+                }
+            }
+        }
+
+        idx  = rmd_rl[j];
+        wmsg = tmp[idx];
+        s    = rmd_sl[j];
+        ki   = rmd_kl[j];
+        tval = al + f + wmsg + ki;
+        n32  = 32;
+        inv_s = n32 - s;
+        tmp2 = (tval << s) | (tval >> inv_s);
+        tval = tmp2 + el;
+        al   = el;
+        el   = dl;
+        tmp2 = (cl << 10) | (cl >> 22);
+        dl   = tmp2;
+        cl   = bl;
+        bl   = tval;
+    }
+
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f;
+        u32 idx;
+        u32 wmsg;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp2;
+
+        if (j < 16) {
+            f = lop3(br, cr, dr, 0x2D);
+        } else {
+            if (j < 32) {
+                f = lop3(br, cr, dr, 0xE4);
+            } else {
+                if (j < 48) {
+                    f = lop3(br, cr, dr, 0x59);
+                } else {
+                    if (j < 64) {
+                        f = lop3(br, cr, dr, 0xCA);
+                    } else {
+                        f = lop3(br, cr, dr, 0x96);
+                    }
+                }
+            }
+        }
+
+        idx  = rmd_rr[j];
+        wmsg = tmp[idx];
+        s    = rmd_sr[j];
+        ki   = rmd_kr[j];
+        tval = ar + f + wmsg + ki;
+        n32  = 32;
+        inv_s = n32 - s;
+        tmp2 = (tval << s) | (tval >> inv_s);
+        tval = tmp2 + er;
+        ar   = er;
+        er   = dr;
+        tmp2 = (cr << 10) | (cr >> 22);
+        dr   = tmp2;
+        cr   = br;
+        br   = tval;
+    }
+
+    // ── Final combination ────────────────────────────────────────────────────
+    u32 t0;
+    u32 t1;
+    u32 t2;
+    u32 t3;
+    u32 t4;
+    t0 = rmd_state[1] + cl + dr;
+    t1 = rmd_state[2] + dl + er;
+    t2 = rmd_state[3] + el + ar;
+    t3 = rmd_state[4] + al + br;
+    t4 = rmd_state[0] + bl + cr;
+    rmd_state[0] = t0;
+    rmd_state[1] = t1;
+    rmd_state[2] = t2;
+    rmd_state[3] = t3;
+    rmd_state[4] = t4;
+}
+
+transmission hash160_launch {
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+}

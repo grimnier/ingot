@@ -1,0 +1,76 @@
+// hash160_black_hole_shape.mtl
+//
+// Physical register contract for the HASH160 black hole kernel.
+// This file documents the intended register map for the split engine design.
+//
+// Build order:
+//   Step 1 (now): This shape compiles and enforces the sealed profile.
+//   Step 2: Fill in the field arithmetic bodies (fe_mul, fe_add carry chains).
+//   Step 3: Batch inversion rail via __shared__ Z products (needs shared-mem grammar extension).
+//   Step 4: Split hash engine (SHA256 + RIPEMD160 as a separate transmission).
+
+// ── Sealed profile: the compiler cannot emit this kernel if it would spill. ──
+
+profile hash160_black_hole_sm89 {
+    max_registers     = 96;
+    spill_allowed     = false;
+    local_memory_allowed = false;
+}
+
+// ── Engine A: point walk + affine normalize ──────────────────────────────────
+//
+// Register map:
+//   R0..R3   affine x limbs (secp256k1 field element, 4 × u64)
+//   R4..R7   affine y limbs
+//   R8..R11  jacobian Z limbs (for batch inversion; zeroed after normalization)
+//   R12..R15 scratch for field multiply / carry chain
+//   R16..R19 scratch for field multiply carry chain (second set)
+//   R20      y_parity (u32)
+//   R21      candidate_offset (u64, position in keyspace batch)
+
+motor point_walk_normalize {
+    // Affine coordinates live in fixed register windows.
+    @window(R0..R3)   u64 aff_x[4];
+    @window(R4..R7)   u64 aff_y[4];
+    @window(R8..R11)  u64 jac_z[4];   // Z for batch inversion rail
+
+    // Scratch windows for field-multiply carry chain.
+    @window(R12..R15) u64 tmp_a[4];
+    @window(R16..R19) u64 tmp_b[4];
+
+    @register(R20) u64 y_parity;        // bit 0 = compressed y parity
+    @register(R21) u64 candidate_offset;
+
+    // ── Field arithmetic bodies (fill in when carry chain is ported) ──
+    //
+    // Real body will be:
+    //   1. Load (X, Y, Z) for current walker position from global rail.
+    //   2. Affine hop: compute lambda, update aff_x and aff_y.
+    //   3. Write jac_z to batch-inversion shared buffer.
+    //   4. After barrier: multiply through inverse to normalize to affine.
+    //   5. Extract y_parity from aff_y[0] bit 0.
+    //   6. Write aff_x, y_parity, candidate_offset to hash engine handoff.
+    //
+    // Placeholder: touch all windows so ptxas cannot DCE them.
+    tmp_a[0] = aff_x[0] + aff_y[0];
+    tmp_b[0] = aff_x[1] + jac_z[0];
+}
+
+// ── Engine A transmission (sealed — no spills, register budget enforced) ──────
+
+transmission point_walk_tx {
+    target nvidia.sm_89;
+    profile hash160_black_hole_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(96);
+    motor point_walk_normalize {
+        inout registers(R0..R3)   u64 aff_x;
+        inout registers(R4..R7)   u64 aff_y;
+        inout registers(R8..R11)  u64 jac_z;
+        inout registers(R12..R15) u64 tmp_a;
+        inout registers(R16..R19) u64 tmp_b;
+        inout R20 u32 y_parity;
+        inout R21 u64 candidate_offset;
+    }
+}

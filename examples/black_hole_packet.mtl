@@ -1,0 +1,167 @@
+// black_hole_packet.mtl
+//
+// Five-stage HASH160 black-hole pipeline using current Ingot syntax.
+// All pointer types use u32*/u64* (no u8* -- not in current type system).
+// HASH160 output (20 bytes) is treated as 5 x u32 words for comparison.
+
+// ── Stage 1: Point arithmetic (projective secp256k1 placeholder) ──────────────
+motor point_rail_motor {
+    @register(R0) u64* x_out;
+    @register(R1) u64* y_out;
+    @register(R2) u64* z_out;
+    @register(R3) u64* x_in;
+    @register(R4) u64* y_in;
+
+    x_out[0] = x_in[0];
+    x_out[1] = x_in[1];
+    x_out[2] = x_in[2];
+    x_out[3] = x_in[3];
+    y_out[0] = y_in[0];
+    y_out[1] = y_in[1];
+    y_out[2] = y_in[2];
+    y_out[3] = y_in[3];
+    z_out[0] = 1;
+    z_out[1] = 0;
+    z_out[2] = 0;
+    z_out[3] = 0;
+}
+
+transmission point_rail_tx {
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor point_rail_motor {
+        out R0 u64* x_out;
+        out R1 u64* y_out;
+        out R2 u64* z_out;
+        in  R3 u64* x_in;
+        in  R4 u64* y_in;
+    }
+}
+
+// ── Stage 2: Normalize (projective -> affine, assumes z=1 placeholder) ────────
+motor normalize_rail_motor {
+    @register(R0) u64* x_affine;
+    @register(R1) u64* y_affine;
+    @register(R2) u64* x_proj;
+    @register(R3) u64* y_proj;
+    @register(R4) u64* z_proj;
+
+    x_affine[0] = x_proj[0];
+    x_affine[1] = x_proj[1];
+    x_affine[2] = x_proj[2];
+    x_affine[3] = x_proj[3];
+    y_affine[0] = y_proj[0];
+    y_affine[1] = y_proj[1];
+    y_affine[2] = y_proj[2];
+    y_affine[3] = y_proj[3];
+}
+
+transmission normalize_rail_tx {
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor normalize_rail_motor {
+        out R0 u64* x_affine;
+        out R1 u64* y_affine;
+        in  R2 u64* x_proj;
+        in  R3 u64* y_proj;
+        in  R4 u64* z_proj;
+    }
+}
+
+// ── Stage 3: Serialize (affine -> compressed pubkey prefix byte) ──────────────
+// pubkey_out[0] = 2 if y even, 3 if y odd. Written as a u32 word (low byte = prefix).
+motor serialize_latch_motor {
+    @register(R0) u32* pubkey_out;
+    @register(R1) u64* x_affine;
+    @register(R2) u64* y_affine;
+
+    u64 y_low;
+    u32 parity;
+    u32 prefix;
+    y_low  = y_affine[0];
+    parity = y_low & 1;
+    prefix = 2 + parity;
+    pubkey_out[0] = prefix;
+    pubkey_out[1] = x_affine[0] & 0xFFFFFFFF;
+    pubkey_out[2] = x_affine[1] & 0xFFFFFFFF;
+    pubkey_out[3] = x_affine[2] & 0xFFFFFFFF;
+    pubkey_out[4] = x_affine[3] & 0xFFFFFFFF;
+}
+
+transmission serialize_latch_tx {
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor serialize_latch_motor {
+        out R0 u32* pubkey_out;
+        in  R1 u64* x_affine;
+        in  R2 u64* y_affine;
+    }
+}
+
+// ── Stage 4: HASH160 (SHA256 then RIPEMD160 -- uses hash160_u32 motor) ────────
+// hash_out[0..4] = RIPEMD160(SHA256(pubkey)) as 5 u32 words (little-endian).
+// Placeholder: copies first 5 words of sha_state to rmd_state.
+motor hash160_latch_motor {
+    @register(R0) u32* hash_out;
+    @register(R1) u32* pubkey_in;
+    @register(R2) u32* sha_state;
+    @register(R3) u32* rmd_state;
+
+    hash_out[0] = rmd_state[0];
+    hash_out[1] = rmd_state[1];
+    hash_out[2] = rmd_state[2];
+    hash_out[3] = rmd_state[3];
+    hash_out[4] = rmd_state[4];
+}
+
+transmission hash160_latch_tx {
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor hash160_latch_motor {
+        out R0 u32* hash_out;
+        in  R1 u32* pubkey_in;
+        in  R2 u32* sha_state;
+        in  R3 u32* rmd_state;
+    }
+}
+
+// ── Stage 5: Candidate status (5-word prefix match) ──────────────────────────
+// Compares 5 u32 words of hash_out against target (= 20 bytes of HASH160).
+// Writes candidate_offset to hit_buf if all 5 words match.
+motor candidate_status_motor {
+    @register(R0) u32*  hash160;
+    @register(R1) u32*  tgt;
+    @register(R2) u64*  hit_buf;
+    @register(R3) u64   candidate_offset;
+
+    u32 w0;
+    u32 w1;
+    u32 w2;
+    u32 w3;
+    u32 w4;
+    u32 t0;
+    u32 t1;
+    u32 t2;
+    u32 t3;
+    u32 t4;
+    u32 match;
+
+    w0 = hash160[0]; w1 = hash160[1]; w2 = hash160[2]; w3 = hash160[3]; w4 = hash160[4];
+    t0 = tgt[0];     t1 = tgt[1];     t2 = tgt[2];     t3 = tgt[3];     t4 = tgt[4];
+    match = (w0 ^ t0) | (w1 ^ t1) | (w2 ^ t2) | (w3 ^ t3) | (w4 ^ t4);
+
+    if (match == 0) {
+        hit_buf[0] = candidate_offset;
+    }
+}
+
+transmission candidate_status_tx {
+    grid  (65536, 1, 1);
+    block (256, 1, 1);
+    motor candidate_status_motor {
+        in    R0 u32* hash160;
+        in    R1 u32* tgt;
+        out   R2 u64* hit_buf;
+        in    R3 u64  candidate_offset;
+    }
+}

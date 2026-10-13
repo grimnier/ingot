@@ -1,0 +1,56 @@
+// Ingot MTL Native Specification — Address-Only Pollard's Kangaroo Engine
+// Zero-Spill Register-Locked PTX Pipeline & Ingot DSL Integration
+
+motor kangaroo_motor {
+    @window(R0..R7)   field Tx;
+    @window(R8..R15)  field Ty;
+    @window(R16..R23) field Wx;
+    @window(R24..R31) field Wy;
+
+    u64 d_tame;
+    u64 d_wild;
+    u32 target_gate;
+    u32 dp_mask;
+
+    __shared__ u32 s_trap_table[512];
+
+    for (int step = 0; step < 1024; step = step + 1) {
+        field Gx;
+        field Gy;
+
+        __syncthreads();
+
+        u32 t_gate = 1772273134; // Low 32-bit Hash160 Proxy
+        u32 w_gate = 1772273134;
+
+        // Module 1: Ω_d Predicate Gate Logic (1-Cycle PTX Abort)
+        if ((t_gate % 4294967296) == target_gate) {
+            atomicAdd(s_trap_table, 1);
+            break;
+        }
+
+        // Module 3: Collision Resolver (Distance Reconstruction Match)
+        if ((w_gate % 4294967296) == target_gate) {
+            atomicAdd(s_trap_table, 2);
+            break;
+        }
+    }
+}
+
+transmission livethine_kangaroo_tx {
+    target nvidia.sm_89;
+    profile secp256k1_kangaroo_v1;
+    grid(32, 1, 1);
+    block(256, 1, 1);
+
+    motor kangaroo_motor {
+        inout registers(R0..R7)   field Tx;
+        inout registers(R8..R15)  field Ty;
+        inout registers(R16..R23) field Wx;
+        inout registers(R24..R31) field Wy;
+        in u64 d_tame;
+        in u64 d_wild;
+        in u32 target_gate;
+        in u32 dp_mask;
+    }
+}

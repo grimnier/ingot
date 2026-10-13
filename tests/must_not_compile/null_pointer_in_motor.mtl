@@ -1,0 +1,6 @@
+(* Must be rejected: assigning null/0 to a pointer inside a motor (null safety rule) *)
+
+motor bad_null {
+    @register(R0) float* p;
+    p = 0;   // ERROR: null literal to pointer forbidden in motor
+}

@@ -1,0 +1,18 @@
+// secp256k1 affine hop: walker + jump -> new walker
+// Mirrors Phase F of leviathan_blockbatch.cu exactly.
+// my_inv must be pre-computed as inverse(jump.x - walker.x).
+
+motor affine_hop {
+    inout affine<secp256k1> walker;
+    in    affine<secp256k1> jump;
+    in    field             my_inv;
+
+    field num    = jump.y - walker.y;
+    field slope  = num * my_inv;
+    field slope2 = slope * slope;
+    field new_ax = slope2 - walker.x - jump.x;
+    field diff   = walker.x - new_ax;
+    field new_ay = slope * diff - walker.y;
+
+    walker = affine(new_ax, new_ay);
+}

@@ -1,0 +1,5 @@
+(* Host/device contamination *)
+
+motor bad_host_call {
+    float x = host_function();   // ERROR: calling host function from inside motor
+}

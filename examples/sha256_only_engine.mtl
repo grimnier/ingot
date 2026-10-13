@@ -1,0 +1,101 @@
+// sha256_only_engine.mtl
+//
+// Black-hole SHA256 engine: sealed-profile, register-locked, spill-free.
+// Identical arithmetic to sha256_compress_u32.mtl but with:
+//   - explicit profile sealing (spill_allowed = false, max_registers = 64)
+//   - target nvidia.sm_89
+//   - require no_spills enforced at compile time
+//
+// Register map:
+//   R0  = msg   (u32* -- 64-word message schedule W[0..63])
+//   R1  = state (u32* -- 8-word hash state H0..H7, updated in-place)
+//   R2  = k     (u32* -- 64 round constants)
+//   R3..R10 = a, b, c, d, e, f, g, h  (working variables)
+
+profile sha256_engine_sm89 {
+    max_registers    = 64;
+    spill_allowed    = false;
+    local_memory_allowed = false;
+}
+
+motor sha256_engine {
+    @register(R0)  u32* msg;
+    @register(R1)  u32* state;
+    @register(R2)  u32* k;
+    @register(R3)  u32 a;
+    @register(R4)  u32 b;
+    @register(R5)  u32 c;
+    @register(R6)  u32 d;
+    @register(R7)  u32 e;
+    @register(R8)  u32 f;
+    @register(R9)  u32 g;
+    @register(R10) u32 h;
+
+    a = state[0];
+    b = state[1];
+    c = state[2];
+    d = state[3];
+    e = state[4];
+    f = state[5];
+    g = state[6];
+    h = state[7];
+
+    for (int i = 0; i < 64; i = i + 1) {
+        u32 w;
+        u32 ki;
+        u32 s1;
+        u32 ch;
+        u32 t1;
+        u32 s0;
+        u32 ma;
+        u32 t2;
+        w  = msg[i];
+        ki = k[i];
+        s1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+        ch = (e & f) ^ (~e & g);
+        t1 = h + s1 + ch + ki + w;
+        s0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+        ma = (a & b) ^ (a & c) ^ (b & c);
+        t2 = s0 + ma;
+        h  = g;
+        g  = f;
+        f  = e;
+        e  = d + t1;
+        d  = c;
+        c  = b;
+        b  = a;
+        a  = t1 + t2;
+    }
+
+    state[0] = a + state[0];
+    state[1] = b + state[1];
+    state[2] = c + state[2];
+    state[3] = d + state[3];
+    state[4] = e + state[4];
+    state[5] = f + state[5];
+    state[6] = g + state[6];
+    state[7] = h + state[7];
+}
+
+transmission sha256_engine_tx {
+    target nvidia.sm_89;
+    profile sha256_engine_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(64);
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+    motor sha256_engine {
+        in  R0 u32* msg;
+        in  R1 u32* state;
+        in  R2 u32* k;
+        inout R3  u32 a;
+        inout R4  u32 b;
+        inout R5  u32 c;
+        inout R6  u32 d;
+        inout R7  u32 e;
+        inout R8  u32 f;
+        inout R9  u32 g;
+        inout R10 u32 h;
+    }
+}

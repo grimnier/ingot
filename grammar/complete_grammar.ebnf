@@ -1,0 +1,434 @@
+(* Ingot Complete Grammar - Phase 1 + WP1 Semantic Layer
+ *
+ * Core rules:
+ *   - motor blocks: pure compute, explicit @register(Rn) hard locks, NO host calls,
+ *     NO cuda*, NO malloc, NO escaping & on locked regs, pointers non-null by construction.
+ *   - Plain-operator motors: direction-typed parameters (inout/in/out) + field/jacobian/affine
+ *     types.  Lowering to PTX intrinsics is defined by the sealed profile in the transmission.
+ *   - transmission blocks: ONLY structural contracts + launch geometry (grid/block/stream)
+ *     + memory layout.  Sealed-profile transmissions add target/profile/verify/require.
+ *   - Contract checker enforces structural compatibility between motor and transmission.
+ *)
+
+program
+    : top_level_decl* EOF
+    ;
+
+top_level_decl
+    : motor_decl
+    | transmission_decl
+    | profile_decl        (* sealed constraint profile body — referenced by name from transmissions *)
+    | packet_decl         (* named register contract shared between motors *)
+    | rail_decl           (* range-and-stride keyspace scan contract *)
+    | target_latch_decl   (* staged hash comparison descriptor *)
+    | route_type_decl     (* typed candidate state enum *)
+    | manifold_decl       (* physical neural tensor memory manifold (WP9) *)
+    | attractor_decl      (* teleological target token pinning descriptor (WP9) *)
+    | host_code_block     (* host code is opaque for Phase 1; not compiled by motor path *)
+    ;
+
+(* ==================== PACKET ==================== *)
+
+(* Named register contract shared between motors.  A packet declares the physical
+   register layout once; any motor that `use`s it gets that layout grafted in.
+   A transmission contract with `packet NAME;` expands to the equivalent field list.
+
+   Only @window and @register fields are legal inside a packet — no assignments,
+   loops, or expressions.  The compiler rejects field/register conflicts at desugar time.
+
+   Example:
+       packet candidate_state {
+           @window(R0..R3)  u64 x[4];      -- 4 field-element limbs in R0..R3
+           @window(R4..R7)  u64 y[4];
+           @register(R8)    u64 y_parity;  -- bit 0 = compressed-y prefix
+           @register(R9)    u64 route_flags;
+           @register(R10)   u64 candidate_offset;
+       }
+
+   Motor use:
+       motor walk { use candidate_state; x[0] = x[1] + y[0]; ... }
+
+   Transmission contract shorthand:
+       transmission walk_tx {
+           target nvidia.sm_89;
+           motor walk { packet candidate_state; }
+       } *)
+
+packet_decl
+    : 'packet' IDENTIFIER '{' packet_field* '}'
+    ;
+
+packet_field
+    : '@window' '(' REGISTER '..' REGISTER ')' type IDENTIFIER ( '[' INTEGER ']' )? ';'
+    | '@register' '(' REGISTER ')' type IDENTIFIER ';'
+    ;
+
+(* In motor body: *)
+packet_use_stmt
+    : 'use' IDENTIFIER ';'
+    ;
+
+(* In motor contract: *)
+packet_contract_ref
+    : 'packet' IDENTIFIER ';'
+    ;
+
+(* ==================== RAIL ==================== *)
+
+(* Range-and-stride contract for a keyspace scan.  Declares the packet that carries
+   walking state, the compile-time-constant scan width, and the symbolic stride name.
+   A motor that `use`s a rail gets NAME_width injected as a compile-time constant.
+
+   Example:
+       rail PointRail {
+           packet: candidate_state;
+           width:  1073741824;   -- 2^30
+           stride: G;            -- secp256k1 generator
+       }
+
+   Motor use:
+       motor walk { use candidate_state; use PointRail; step = PointRail_width; ... } *)
+
+rail_decl
+    : 'rail' IDENTIFIER '{' rail_body '}'
+    ;
+
+rail_body
+    : 'packet' ':' IDENTIFIER ';'
+      'width'  ':' INTEGER    ';'
+      'stride' ':' IDENTIFIER ';'
+    ;
+
+(* ==================== TARGET LATCH ==================== *)
+
+(* Staged comparison descriptor for a streaming hash pipeline.  compare_at names
+   the natural early-exit checkpoints in evaluation order (earliest exit first).
+   No constants are injected — the latch is recorded for compiler analysis only.
+
+   Example:
+       target_latch Hash160Match {
+           target_bytes: 20;
+           compare_at:   [ripemd_word0, ripemd_word1, ripemd_full];
+       }
+
+   Motor use:
+       motor h { use Hash160Match; ... }  -- records Hash160Match in motor.used_latches *)
+
+target_latch_decl
+    : 'target_latch' IDENTIFIER '{' target_latch_body '}'
+    ;
+
+target_latch_body
+    : 'target_bytes' ':' INTEGER ';'
+      'compare_at'   ':' '[' IDENTIFIER ( ',' IDENTIFIER )* ']' ';'
+    ;
+
+(* ==================== ROUTE TYPE ==================== *)
+
+(* Typed enum of candidate states.  Each variant is injected as a compile-time
+   integer constant into any motor that `use`s this route_type.
+
+   Example:
+       route_type CandidateStatus {
+           LIVE      = 0;
+           DEAD      = 1;
+           EXACT_HIT = 2;
+       }
+
+   Motor use:
+       motor classify { use CandidateStatus; route_flags = DEAD; } *)
+
+route_type_decl
+    : 'route_type' IDENTIFIER '{' route_variant+ '}'
+    ;
+
+route_variant
+    : IDENTIFIER '=' INTEGER ';'
+    ;
+
+(* ==================== SEALED PROFILE ==================== *)
+
+(* Top-level profile body.  A transmission references it by name: `profile hash160_no_spill;`
+   The compiler looks up the body and enforces its constraints via ptxas at compile time. *)
+profile_decl
+    : 'profile' IDENTIFIER '{' profile_property* '}'
+    ;
+
+profile_property
+    : 'max_registers'          '=' INTEGER ';'   (* reject if ptxas register count > N *)
+    | 'spill_allowed'          '=' BOOL    ';'   (* false → fail on any spill store/load/stack *)
+    | 'local_memory_allowed'   '=' BOOL    ';'   (* false → fail if ld.local/st.local present *)
+    ;
+
+BOOL : 'true' | 'false' ;
+
+(* ==================== MOTOR ==================== *)
+
+motor_decl
+    : 'motor' IDENTIFIER ( register_annotation )? '{' motor_param* motor_stmt* '}'
+    ;
+
+(* Direction-typed parameters for plain-operator motors.
+   These appear at the top of the motor body before any computation statements.
+   Example: inout jacobian<secp256k1> walker;  *)
+motor_param
+    : direction type IDENTIFIER ';'
+    ;
+
+register_annotation
+    : '@register' '(' REGISTER ')'
+    ;
+
+REGISTER
+    : 'R' [0-9]+     (* R0 - R255 max in practice *)
+    ;
+
+motor_stmt
+    : var_decl ';'
+    | window_decl           (* register-windowed array; desugars to locked var decls *)
+    | assignment_stmt ';'
+    | for_stmt
+    | if_stmt
+    | return_stmt ';'
+    | block
+    | expr_stmt ';'
+    ;
+
+var_decl
+    : ( register_annotation )? type IDENTIFIER ( array_suffix )? ( '=' expr )?
+    ;
+
+(* Register-windowed array.  Declares consecutive physical registers as a named array.
+   Indices must be compile-time integer constants — dynamic indexing into physical registers
+   is rejected at compile time. *)
+window_decl
+    : '@window' '(' REGISTER '..' REGISTER ')' type IDENTIFIER ( '[' INTEGER ']' )? ';'
+    ;
+
+(* The count in the optional [N] must match end_register - start_register + 1.
+   Example: @window(R0..R3) u64 X_limbs[4];  — declares X_limbs[0]=R0 … X_limbs[3]=R3 *)
+
+array_suffix
+    : '[' expr ']'
+    ;
+
+assignment_stmt
+    : lvalue '=' expr
+    ;
+
+lvalue
+    : postfix_expr      (* covers Var, Index, and member access on the left side *)
+    ;
+
+for_stmt
+    : 'for' '(' for_init ';' expr ';' for_update ')' block_or_stmt
+    ;
+
+for_init
+    : var_decl
+    | assignment_stmt
+    | /* empty */
+    ;
+
+for_update
+    : assignment_stmt
+    | expr
+    ;
+
+if_stmt
+    : 'if' '(' expr ')' block_or_stmt ( 'else' block_or_stmt )?
+    ;
+
+return_stmt
+    : 'return' ( expr )?
+    ;
+
+block
+    : '{' motor_stmt* '}'
+    ;
+
+block_or_stmt
+    : block
+    | motor_stmt
+    ;
+
+expr_stmt
+    : expr
+    ;
+
+expr
+    : logical_or_expr
+    ;
+
+logical_or_expr  : logical_and_expr ( '||' logical_and_expr )* ;
+logical_and_expr : bitwise_or_expr  ( '&&' bitwise_or_expr  )* ;
+bitwise_or_expr  : bitwise_xor_expr ( '|'  bitwise_xor_expr )* ;
+bitwise_xor_expr : bitwise_and_expr ( '^'  bitwise_and_expr )* ;
+bitwise_and_expr : equality_expr    ( '&'  equality_expr    )* ;
+equality_expr    : relational_expr  ( ('=='|'!=') relational_expr )* ;
+relational_expr  : shift_expr       ( ('<'|'<='|'>'|'>=') shift_expr )* ;
+shift_expr       : additive_expr    ( ('>>'|'<<') additive_expr )* ;
+additive_expr    : multiplicative_expr ( ('+'|'-') multiplicative_expr )* ;
+multiplicative_expr : unary_expr    ( ('*'|'/'|'%') unary_expr )* ;
+
+unary_expr
+    : ('-' | '!' | '&' | '*' | '~') unary_expr
+    | postfix_expr
+    ;
+
+postfix_expr
+    : primary ( '.' IDENTIFIER | '[' expr ']' )*
+    ;
+
+primary
+    : IDENTIFIER
+    | type_keyword_as_expr   (* field.one, jacobian(...), affine(...) in expr position *)
+    | INTEGER
+    | FLOAT
+    | 'true' | 'false'
+    | BUILTIN                (* threadIdx.x, blockIdx.x, etc. *)
+    | '(' expr ')'
+    | IDENTIFIER '(' expr_list? ')'    (* function/constructor call *)
+    ;
+
+(* field, jacobian, affine appear in expression position for field.one, jacobian(x,y,z) etc. *)
+type_keyword_as_expr
+    : ( 'field' | 'jacobian' | 'affine' ) ( '(' expr_list? ')' )?
+    ;
+
+binary_op
+    : '+' | '-' | '*' | '/' | '%' | '==' | '!=' | '<' | '<=' | '>' | '>=' | '&&' | '||'
+    | '&' | '|' | '^' | '>>' | '<<'
+    ;
+
+unary_op
+    : '-' | '!' | '&' | '*' | '~'
+    ;
+
+expr_list
+    : expr ( ',' expr )*
+    ;
+
+type
+    : 'field'                                     (* GF(p) element, context-resolved *)
+    | ('jacobian' | 'affine') '<' IDENTIFIER '>' (* e.g. jacobian<secp256k1> *)
+    | primitive_type ( '*' )?                     (* existing scalar and pointer types *)
+    ;
+
+primitive_type
+    : 'int' | 'uint' | 'float' | 'double'
+    | 'i32' | 'u32' | 'f32' | 'f64'
+    | 'i64' | 'u64'
+    ;
+
+(* ==================== TRANSMISSION ==================== *)
+
+transmission_decl
+    : 'transmission' IDENTIFIER '{'
+        target_clause?
+        profile_clause?
+        ( verify_clause | require_clause )*
+        grid_decl?
+        block_decl?
+        stream_decl?
+        motor_contract?
+      '}'
+    ;
+
+(* Sealed-profile transmissions (target = nvidia.sm_89 etc.) omit grid/block;
+   launch geometry is set by the outer executor. *)
+
+target_clause
+    : 'target' dotted_name ';'
+    ;
+
+profile_clause
+    : 'profile' IDENTIFIER ';'
+    ;
+
+dotted_name
+    : IDENTIFIER ( '.' IDENTIFIER )*
+    ;
+
+verify_clause
+    : 'verify' IDENTIFIER ( '(' IDENTIFIER ')' )? ';'
+    ;
+
+require_clause
+    : 'require' IDENTIFIER ( '(' require_arg ')' )? ';'
+    ;
+
+require_arg
+    : INTEGER        (* for max_registers(96) *)
+    | expr           (* for input_invariant(expr) *)
+    ;
+
+grid_decl
+    : 'grid' '(' dim3 ')' ';'
+    ;
+
+block_decl
+    : 'block' '(' dim3 ')' ';'
+    ;
+
+stream_decl
+    : 'stream' IDENTIFIER ';'
+    ;
+
+dim3
+    : expr ( ',' expr ( ',' expr )? )?
+    ;
+
+motor_contract
+    : 'motor' IDENTIFIER ( '@boundary_lock' '(' IDENTIFIER ')' )? '{'
+        motor_contract_param*
+      '}'
+    ;
+
+motor_contract_param
+    : direction ( 'registers' '(' REGISTER '..' REGISTER ')' )? type IDENTIFIER ( align_annotation )? ';'
+    | direction REGISTER type IDENTIFIER ( align_annotation )? ';'  (* legacy explicit register port *)
+    ;
+
+direction
+    : 'in' | 'out' | 'inout'
+    ;
+
+align_annotation
+    : '@align' '(' INTEGER ')'
+    ;
+
+(* ==================== LEXICAL ==================== *)
+
+IDENTIFIER : [a-zA-Z_][a-zA-Z0-9_]* ;
+INTEGER    : [0-9]+ | '0x' [0-9a-fA-F]+ ;
+FLOAT      : [0-9]+ '.' [0-9]+ ( [eE] [+-]? [0-9]+ )? ;
+DOTDOT     : '..' ;
+DOT        : '.' ;
+
+COMMENT    : '//' .* | '/*' .* '*/' ;
+
+WS         : [ \t\r\n]+ ;
+
+(* No host/device contamination tokens allowed inside motor bodies by semantic rules *)
+
+(* ==================== WARP INTRINSICS ==================== *)
+
+(* Thread-barrier and warp shuffle calls are ordinary IDENTIFIER '(' expr_list ')' call expressions.
+   They lower to specific PTX instructions in the IR builder:
+
+   syncthreads()                        → bar.sync 0;      (CTA-wide barrier; void, used as ExprStmt)
+   shfl_sync_u32(mask, src, lane)       → shfl.sync.idx.b32  dest, src, lane,   0x1f, mask;
+   shfl_up_sync_u32(mask, src, delta)   → shfl.sync.up.b32   dest, src, delta,  0,    mask;
+   shfl_down_sync_u32(mask, src, delta) → shfl.sync.down.b32 dest, src, delta,  0x1f, mask;
+   shfl_bfly_sync_u32(mask, src, xmask)→ shfl.sync.bfly.b32 dest, src, xmask,  0x1f, mask;
+   lane_id()                            → mov.u32 dest, %laneid;
+
+   All shuffle variants return u32.  For a 4-limb u64 field element, call the u32 variant
+   four times (once per limb register) — the explicit @window register map makes this
+   a direct four-call sequence with no indirection.
+
+   clamp encoding for full-warp (warp_sz=32, no segmentation):
+     idx / down / bfly : (0 << 8) | 31  → 0x1f
+     up                : (0 << 8) |  0  → 0x00   (no upper-lane clamping) *)
+

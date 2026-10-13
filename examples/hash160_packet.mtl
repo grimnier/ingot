@@ -1,0 +1,95 @@
+// hash160_packet.mtl
+//
+// Demonstrates the packet feature: one register contract shared between two motors.
+//
+// The packet declares the physical register layout once.  Both point_walk and
+// hash160_compare use it — no chance of a mismatch at the handoff boundary.
+//
+// Compile all transmissions into one PTX:
+//   python ingotc.py examples/hash160_packet.mtl --all-kernels --emit-ptx
+
+// ── Shared register contract ────────────────────────────────────────────────────
+//
+// Candidate state carried between the walk rail and the hash rail:
+//   R0..R3   affine X limbs       (secp256k1 field element, 4 × u64)
+//   R4..R7   affine Y limbs
+//   R8       y_parity             (bit 0 = compressed-point prefix)
+//   R9       route_flags          (bit 0: tail_possible; bit 1: dead_walk)
+//   R10      candidate_offset     (position in the keyspace batch)
+
+packet candidate_state {
+    @window(R0..R3)  u64 x[4];
+    @window(R4..R7)  u64 y[4];
+    @register(R8)    u64 y_parity;
+    @register(R9)    u64 route_flags;
+    @register(R10)   u64 candidate_offset;
+}
+
+// ── Sealed profile ─────────────────────────────────────────────────────────────
+
+profile sealed_sm89 {
+    max_registers     = 96;
+    spill_allowed     = false;
+    local_memory_allowed = false;
+}
+
+// ══ Engine A: point walk + normalize ══════════════════════════════════════════
+
+motor point_walk {
+    // Graft the shared packet layout.  x[0..3], y[0..3], y_parity,
+    // route_flags, and candidate_offset are all live in physical registers.
+    use candidate_state;
+
+    // Additional scratch for field-multiply carry chain (not in the packet —
+    // these are private to this motor and do not cross the handoff boundary).
+    @window(R11..R14) u64 tmp_a[4];
+    @window(R15..R18) u64 tmp_b[4];
+
+    // Placeholder body: touch every window so ptxas cannot DCE the kernel.
+    tmp_a[0] = x[0] + y[0];
+    tmp_b[0] = x[1] + y[1];
+    y_parity = tmp_a[0] & 1;
+    route_flags = candidate_offset + x[2];
+}
+
+transmission walk_tx {
+    target nvidia.sm_89;
+    profile sealed_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(96);
+    motor point_walk {
+        // Packet expands to all five field groups at the handoff boundary.
+        packet candidate_state;
+        // Private scratch windows listed explicitly.
+        inout registers(R11..R14) u64 tmp_a;
+        inout registers(R15..R18) u64 tmp_b;
+    }
+}
+
+// ══ Engine B: HASH160 compress + compare ══════════════════════════════════════
+
+motor hash160_compare {
+    // Same physical register contract — guaranteed to match Engine A's output.
+    use candidate_state;
+
+    // SHA256 working variables (private to this motor).
+    @window(R11..R18) u64 sha_wv[8];
+
+    // Placeholder body.
+    sha_wv[0] = x[0] + y_parity;
+    sha_wv[1] = x[1] + route_flags;
+    sha_wv[2] = candidate_offset + sha_wv[0];
+}
+
+transmission hash_tx {
+    target nvidia.sm_89;
+    profile sealed_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(96);
+    motor hash160_compare {
+        packet candidate_state;
+        inout registers(R11..R18) u64 sha_wv;
+    }
+}

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.ptx
+*.cubin
+*.exe
+*.obj
+*.o
+*.log
+.venv/
+.pytest_cache/
+work/
+probe/

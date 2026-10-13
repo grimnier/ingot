@@ -1,0 +1,9 @@
+(* This must fail: taking the address of a register-locked variable in an escaping way *)
+
+motor bad_register_escape {
+    @register(R7) float value;
+
+    // ERROR: cannot take address of register-locked variable and escape it
+    float* ptr = &value;
+    return ptr;
+}

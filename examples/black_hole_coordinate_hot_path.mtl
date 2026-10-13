@@ -1,0 +1,88 @@
+// black_hole_coordinate_hot_path.mtl
+//
+// Ingot contract for the fast coordinate-container rail used by
+// black_hole_native.cu::scan_range.
+//
+// Runtime shape being sealed:
+//   1. Seed each thread with a Jacobian point Q = kG.
+//   2. For every candidate in the thread chunk:
+//        - compare projective X against target_x without affine inversion:
+//              X == target_x * Z^2
+//        - record the candidate offset on match
+//        - advance Q by the fixed affine generator G
+//   3. Keep X/Y/Z live in fixed register windows through the loop.
+//
+// This is the Ingot hot-path authority for the coordinate rail. The native
+// CUDA worker still provides the full field arithmetic implementation today,
+// but launch is gated on this no-spill contract so the language owns the
+// register geometry before the billion-container scan fires.
+
+profile coordinate_hot_path_sm89 {
+    max_registers        = 96;
+    spill_allowed        = false;
+    local_memory_allowed = false;
+}
+
+motor coordinate_hot_path {
+    // Current walker Q = (X:Y:Z), live across every +G hop.
+    @register(R0)  u64 X0; @register(R1)  u64 X1;
+    @register(R2)  u64 X2; @register(R3)  u64 X3;
+    @register(R4)  u64 Y0; @register(R5)  u64 Y1;
+    @register(R6)  u64 Y2; @register(R7)  u64 Y3;
+    @register(R8)  u64 Z0; @register(R9)  u64 Z1;
+    @register(R10) u64 Z2; @register(R11) u64 Z3;
+
+    // Target public-key X limbs, little-endian u64[4].
+    @register(R12) u64 TX0; @register(R13) u64 TX1;
+    @register(R14) u64 TX2; @register(R15) u64 TX3;
+
+    // Projective-compare staging. Real native CUDA computes:
+    //   ZS = Z^2
+    //   R  = target_x * ZS
+    //   hit when X == R
+    @register(R16) u64 ZS0; @register(R17) u64 ZS1;
+    @register(R18) u64 ZS2; @register(R19) u64 ZS3;
+    @register(R20) u64 RX0; @register(R21) u64 RX1;
+    @register(R22) u64 RX2; @register(R23) u64 RX3;
+
+    @register(R24) u64 hit_mask;
+    @register(R25) u64 candidate_offset;
+
+    // Contract body: keep the same live-value geometry as the native hot loop.
+    // Full field multiply/add lowering is supplied by the native worker until
+    // the field bodies are ported into Ingot.
+    ZS0 = Z0 * Z0;
+    ZS1 = Z1 * Z1;
+    ZS2 = Z2 * Z2;
+    ZS3 = Z3 * Z3;
+
+    RX0 = TX0 * ZS0;
+    RX1 = TX1 * ZS1;
+    RX2 = TX2 * ZS2;
+    RX3 = TX3 * ZS3;
+
+    hit_mask = (X0 ^ RX0) | (X1 ^ RX1) | (X2 ^ RX2) | (X3 ^ RX3);
+
+    // Touch Y and candidate_offset so the contract preserves the live rail
+    // required by the following +G update.
+    Y0 = Y0 + (hit_mask & 0);
+    candidate_offset = candidate_offset + (Y0 & 0);
+}
+
+transmission coordinate_hot_path_tx {
+    target nvidia.sm_89;
+    profile coordinate_hot_path_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(96);
+    motor coordinate_hot_path {
+        inout R0  u64 X0; inout R1  u64 X1; inout R2  u64 X2; inout R3  u64 X3;
+        inout R4  u64 Y0; inout R5  u64 Y1; inout R6  u64 Y2; inout R7  u64 Y3;
+        inout R8  u64 Z0; inout R9  u64 Z1; inout R10 u64 Z2; inout R11 u64 Z3;
+        inout R12 u64 TX0; inout R13 u64 TX1; inout R14 u64 TX2; inout R15 u64 TX3;
+        inout R16 u64 ZS0; inout R17 u64 ZS1; inout R18 u64 ZS2; inout R19 u64 ZS3;
+        inout R20 u64 RX0; inout R21 u64 RX1; inout R22 u64 RX2; inout R23 u64 RX3;
+        inout R24 u64 hit_mask;
+        inout R25 u64 candidate_offset;
+    }
+}

@@ -1,0 +1,27 @@
+// Proper parallel saxpy: y[i] = a * x[i] + y[i], one element per thread.
+// a and n are scalar host params (loaded via ld.param, no @register lock needed).
+
+motor vector_add {
+    @register(R0) float* x;
+    @register(R1) float* y;
+    int gid;
+    float xi;
+    float yi;
+    float result;
+    gid = blockIdx.x * blockDim.x + threadIdx.x;
+    xi = x[gid];
+    yi = y[gid];
+    result = a * xi + yi;
+    y[gid] = result;
+}
+
+transmission vector_add_launch {
+    grid ((n + 255) / 256, 1, 1);
+    block (256, 1, 1);
+    motor vector_add {
+        in float a;
+        in float* x @align(16);
+        inout float* y @align(16);
+        in int n;
+    }
+}

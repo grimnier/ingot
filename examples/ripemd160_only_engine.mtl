@@ -1,0 +1,195 @@
+// ripemd160_only_engine.mtl
+//
+// Black-hole RIPEMD-160 engine: sealed-profile, register-locked, spill-free.
+// Identical arithmetic to ripemd160_compress_u32.mtl but with:
+//   - explicit profile sealing (spill_allowed = false, max_registers = 64)
+//   - target nvidia.sm_89
+//   - require no_spills enforced at compile time
+//
+// Register map:
+//   R0  = msg   (u32* -- 16 little-endian message words)
+//   R1  = state (u32* -- 5 hash state words, updated in-place)
+//   R2  = rl    (u32* -- 80 left-track message indices)
+//   R3  = rr    (u32* -- 80 right-track message indices)
+//   R4  = sl    (u32* -- 80 left-track rotation amounts)
+//   R5  = sr    (u32* -- 80 right-track rotation amounts)
+//   R6  = kl    (u32* -- 80 left-track round constants)
+//   R7  = kr    (u32* -- 80 right-track round constants)
+//   R8..R12  = al, bl, cl, dl, el  (left track)
+//   R13..R17 = ar, br, cr, dr, er  (right track)
+
+profile ripemd160_engine_sm89 {
+    max_registers    = 64;
+    spill_allowed    = false;
+    local_memory_allowed = false;
+}
+
+motor ripemd160_engine {
+    @register(R0)  u32* msg;
+    @register(R1)  u32* state;
+    @register(R2)  u32* rl;
+    @register(R3)  u32* rr;
+    @register(R4)  u32* sl;
+    @register(R5)  u32* sr;
+    @register(R6)  u32* kl;
+    @register(R7)  u32* kr;
+    @register(R8)  u32 al;
+    @register(R9)  u32 bl;
+    @register(R10) u32 cl;
+    @register(R11) u32 dl;
+    @register(R12) u32 el;
+    @register(R13) u32 ar;
+    @register(R14) u32 br;
+    @register(R15) u32 cr;
+    @register(R16) u32 dr;
+    @register(R17) u32 er;
+
+    al = state[0];
+    bl = state[1];
+    cl = state[2];
+    dl = state[3];
+    el = state[4];
+    ar = state[0];
+    br = state[1];
+    cr = state[2];
+    dr = state[3];
+    er = state[4];
+
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f;
+        u32 idx;
+        u32 w;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp;
+
+        if (j < 16) {
+            f = bl ^ cl ^ dl;
+        } else {
+            if (j < 32) {
+                f = (bl & cl) | (~bl & dl);
+            } else {
+                if (j < 48) {
+                    f = (bl | ~cl) ^ dl;
+                } else {
+                    if (j < 64) {
+                        f = (bl & dl) | (cl & ~dl);
+                    } else {
+                        f = bl ^ (cl | ~dl);
+                    }
+                }
+            }
+        }
+
+        idx  = rl[j];
+        w    = msg[idx];
+        s    = sl[j];
+        ki   = kl[j];
+        tval = al + f + w + ki;
+        n32  = 32;
+        inv_s = n32 - s;
+        tmp  = (tval << s) | (tval >> inv_s);
+        tval = tmp + el;
+        al   = el;
+        el   = dl;
+        tmp  = (cl << 10) | (cl >> 22);
+        dl   = tmp;
+        cl   = bl;
+        bl   = tval;
+    }
+
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 f;
+        u32 idx;
+        u32 w;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp;
+
+        if (j < 16) {
+            f = br ^ (cr | ~dr);
+        } else {
+            if (j < 32) {
+                f = (br & dr) | (cr & ~dr);
+            } else {
+                if (j < 48) {
+                    f = (br | ~cr) ^ dr;
+                } else {
+                    if (j < 64) {
+                        f = (br & cr) | (~br & dr);
+                    } else {
+                        f = br ^ cr ^ dr;
+                    }
+                }
+            }
+        }
+
+        idx  = rr[j];
+        w    = msg[idx];
+        s    = sr[j];
+        ki   = kr[j];
+        tval = ar + f + w + ki;
+        n32  = 32;
+        inv_s = n32 - s;
+        tmp  = (tval << s) | (tval >> inv_s);
+        tval = tmp + er;
+        ar   = er;
+        er   = dr;
+        tmp  = (cr << 10) | (cr >> 22);
+        dr   = tmp;
+        cr   = br;
+        br   = tval;
+    }
+
+    u32 t0;
+    u32 t1;
+    u32 t2;
+    u32 t3;
+    u32 t4;
+    t0 = state[1] + cl + dr;
+    t1 = state[2] + dl + er;
+    t2 = state[3] + el + ar;
+    t3 = state[4] + al + br;
+    t4 = state[0] + bl + cr;
+    state[0] = t0;
+    state[1] = t1;
+    state[2] = t2;
+    state[3] = t3;
+    state[4] = t4;
+}
+
+transmission ripemd160_engine_tx {
+    target nvidia.sm_89;
+    profile ripemd160_engine_sm89;
+    require no_spills;
+    require no_local_memory;
+    require max_registers(64);
+    grid  (1, 1, 1);
+    block (256, 1, 1);
+    motor ripemd160_engine {
+        in    R0 u32* msg;
+        inout R1 u32* state;
+        in    R2 u32* rl;
+        in    R3 u32* rr;
+        in    R4 u32* sl;
+        in    R5 u32* sr;
+        in    R6 u32* kl;
+        in    R7 u32* kr;
+        inout R8  u32 al;
+        inout R9  u32 bl;
+        inout R10 u32 cl;
+        inout R11 u32 dl;
+        inout R12 u32 el;
+        inout R13 u32 ar;
+        inout R14 u32 br;
+        inout R15 u32 cr;
+        inout R16 u32 dr;
+        inout R17 u32 er;
+    }
+}

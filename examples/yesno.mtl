@@ -1,0 +1,16 @@
+// Each agent does ONE yes/no: derive a candidate, compare to the P71 target, flag.
+// Measures the raw yes/no throughput at billion-agent scale (no hash compute).
+motor yesno {
+    @register(R0) u64* flag;
+    u64 gid; gid = blockIdx.x * blockDim.x + threadIdx.x;
+    u64 v;   v = gid * 2654435761;
+    u64 t;   t = 0xF6F5431D25BBF7B1;
+    u64 hit; hit = v ^ t;
+    u64 idx; idx = gid & 1023;
+    flag[idx] = hit;
+}
+transmission yesno_launch {
+    grid (1, 1, 1);
+    block (256, 1, 1);
+    motor yesno { out u64* flag; }
+}

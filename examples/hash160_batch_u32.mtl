@@ -1,0 +1,358 @@
+// HASH160 batched: each GPU thread processes its own pubkey slice.
+//
+// Buffer layout (flat arrays, N = total thread count):
+//   sha_msg   [N * 64]  u32 -- pre-expanded SHA256 message schedule per thread
+//   sha_state [N *  8]  u32 -- SHA256 IV in, SHA256 output out, per thread
+//   sha_k     [    64]  u32 -- SHA256 round constants (shared, read-only)
+//   tmp       [N * 16]  u32 -- bridge buffer (byte-swapped SHA256 → RMD input), per thread
+//   rmd_state [N *  5]  u32 -- RIPEMD-160 IV in, HASH160 output out, per thread
+//   rmd_rl/rr [    80]  u32 -- RIPEMD-160 message selection tables (shared)
+//   rmd_sl/sr [    80]  u32 -- RIPEMD-160 shift amounts (shared)
+//   rmd_kl/kr [    80]  u32 -- RIPEMD-160 round constants (shared)
+//
+// Thread N accesses:
+//   sha_msg[N*64 .. N*64+63], sha_state[N*8 .. N*8+7], tmp[N*16 .. N*16+15],
+//   rmd_state[N*5 .. N*5+4]
+
+motor hash160_batch_u32 {
+
+    @register(R0)  u32* sha_msg;
+    @register(R1)  u32* sha_state;
+    @register(R2)  u32* sha_k;
+    @register(R3)  u32 a;
+    @register(R4)  u32 b;
+    @register(R5)  u32 c;
+    @register(R6)  u32 d;
+    @register(R7)  u32 e;
+    @register(R8)  u32 f;
+    @register(R9)  u32 g;
+    @register(R10) u32 h;
+    @register(R11) u32* tmp;
+    @register(R12) u32* rmd_state;
+    @register(R13) u32* rmd_rl;
+    @register(R14) u32* rmd_rr;
+    @register(R15) u32* rmd_sl;
+    @register(R16) u32* rmd_sr;
+    @register(R17) u32* rmd_kl;
+    @register(R18) u32* rmd_kr;
+    @register(R19) u32 al;
+    @register(R20) u32 bl;
+    @register(R21) u32 cl;
+    @register(R22) u32 dl;
+    @register(R23) u32 el;
+    @register(R24) u32 ar;
+    @register(R25) u32 br;
+    @register(R26) u32 cr;
+    @register(R27) u32 dr;
+    @register(R28) u32 er;
+
+    // Global thread ID
+    int gid;
+    gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Per-thread flat-buffer base indices
+    int m_base;     // sha_msg   base: gid * 64
+    int s_base;     // sha_state base: gid *  8
+    u32 t_base;     // tmp       base: gid * 16  (u32 -- added to u32 rmd_rl index)
+    int r_base;     // rmd_state base: gid *  5
+
+    m_base = gid * 64;
+    s_base = gid * 8;
+    t_base = gid * 16;
+    r_base = gid * 5;
+
+    // Pre-compute sha_state indices for this thread (used in prologue + epilogue)
+    int ss0; int ss1; int ss2; int ss3;
+    int ss4; int ss5; int ss6; int ss7;
+    ss0 = s_base;
+    ss1 = s_base + 1;
+    ss2 = s_base + 2;
+    ss3 = s_base + 3;
+    ss4 = s_base + 4;
+    ss5 = s_base + 5;
+    ss6 = s_base + 6;
+    ss7 = s_base + 7;
+
+    // ── Phase 1: SHA256 compression ─────────────────────────────────────────
+    a = sha_state[ss0];
+    b = sha_state[ss1];
+    c = sha_state[ss2];
+    d = sha_state[ss3];
+    e = sha_state[ss4];
+    f = sha_state[ss5];
+    g = sha_state[ss6];
+    h = sha_state[ss7];
+
+    for (int i = 0; i < 64; i = i + 1) {
+        int midx;
+        u32 w;
+        u32 ki;
+        u32 s1e;
+        u32 ch;
+        u32 t1;
+        u32 s0;
+        u32 ma;
+        u32 t2;
+        midx = m_base + i;
+        w   = sha_msg[midx];
+        ki  = sha_k[i];
+        s1e = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+        ch  = (e & f) ^ (~e & g);
+        t1  = h + s1e + ch + ki + w;
+        s0  = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+        ma  = (a & b) ^ (a & c) ^ (b & c);
+        t2  = s0 + ma;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    sha_state[ss0] = a + sha_state[ss0];
+    sha_state[ss1] = b + sha_state[ss1];
+    sha_state[ss2] = c + sha_state[ss2];
+    sha_state[ss3] = d + sha_state[ss3];
+    sha_state[ss4] = e + sha_state[ss4];
+    sha_state[ss5] = f + sha_state[ss5];
+    sha_state[ss6] = g + sha_state[ss6];
+    sha_state[ss7] = h + sha_state[ss7];
+
+    // ── Phase 2: byte-swap bridge (SHA256 BE → RIPEMD-160 LE) ────────────────
+    // bswap32(x) = (x>>24) | ((x>>8)&0x0000FF00) | ((x<<8)&0x00FF0000) | (x<<24)
+    u32 bm1;
+    u32 bm2;
+    u32 bb0;
+    u32 bb1;
+    u32 bb2;
+    u32 bb3;
+    u32 bw;
+    u32 bzero;
+    bm1   = 0x0000FF00;
+    bm2   = 0x00FF0000;
+    bzero = 0;
+
+    // Pre-compute tmp indices for this thread
+    u32 tb0;  u32 tb1;  u32 tb2;  u32 tb3;
+    u32 tb4;  u32 tb5;  u32 tb6;  u32 tb7;
+    u32 tb8;  u32 tb9;  u32 tb10; u32 tb11;
+    u32 tb12; u32 tb13; u32 tb14; u32 tb15;
+    tb0  = t_base;
+    tb1  = t_base + 1;
+    tb2  = t_base + 2;
+    tb3  = t_base + 3;
+    tb4  = t_base + 4;
+    tb5  = t_base + 5;
+    tb6  = t_base + 6;
+    tb7  = t_base + 7;
+    tb8  = t_base + 8;
+    tb9  = t_base + 9;
+    tb10 = t_base + 10;
+    tb11 = t_base + 11;
+    tb12 = t_base + 12;
+    tb13 = t_base + 13;
+    tb14 = t_base + 14;
+    tb15 = t_base + 15;
+
+    bw = sha_state[ss0];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb0] = bb0 | bb1 | bb2 | bb3;
+
+    bw = sha_state[ss1];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb1] = bb0 | bb1 | bb2 | bb3;
+
+    bw = sha_state[ss2];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb2] = bb0 | bb1 | bb2 | bb3;
+
+    bw = sha_state[ss3];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb3] = bb0 | bb1 | bb2 | bb3;
+
+    bw = sha_state[ss4];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb4] = bb0 | bb1 | bb2 | bb3;
+
+    bw = sha_state[ss5];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb5] = bb0 | bb1 | bb2 | bb3;
+
+    bw = sha_state[ss6];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb6] = bb0 | bb1 | bb2 | bb3;
+
+    bw = sha_state[ss7];
+    bb0 = bw >> 24; bb1 = (bw >> 8) & bm1; bb2 = (bw << 8) & bm2; bb3 = bw << 24;
+    tmp[tb7] = bb0 | bb1 | bb2 | bb3;
+
+    u32 bpad;
+    u32 blen;
+    bpad     = 0x00000080;
+    blen     = 0x00000100;
+    tmp[tb8]  = bpad;
+    tmp[tb9]  = bzero;
+    tmp[tb10] = bzero;
+    tmp[tb11] = bzero;
+    tmp[tb12] = bzero;
+    tmp[tb13] = bzero;
+    tmp[tb14] = blen;
+    tmp[tb15] = bzero;
+
+    // ── Phase 3: RIPEMD-160 left track ───────────────────────────────────────
+    // Pre-compute rmd_state indices for this thread
+    int rs0; int rs1; int rs2; int rs3; int rs4;
+    rs0 = r_base;
+    rs1 = r_base + 1;
+    rs2 = r_base + 2;
+    rs3 = r_base + 3;
+    rs4 = r_base + 4;
+
+    al = rmd_state[rs0]; bl = rmd_state[rs1]; cl = rmd_state[rs2];
+    dl = rmd_state[rs3]; el = rmd_state[rs4];
+    ar = rmd_state[rs0]; br = rmd_state[rs1]; cr = rmd_state[rs2];
+    dr = rmd_state[rs3]; er = rmd_state[rs4];
+
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 fl;
+        u32 idx;
+        u32 tmidx;
+        u32 wmsg;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp2;
+
+        if (j < 16) {
+            fl = bl ^ cl ^ dl;
+        } else {
+            if (j < 32) {
+                fl = (bl & cl) | (~bl & dl);
+            } else {
+                if (j < 48) {
+                    fl = (bl | ~cl) ^ dl;
+                } else {
+                    if (j < 64) {
+                        fl = (bl & dl) | (cl & ~dl);
+                    } else {
+                        fl = bl ^ (cl | ~dl);
+                    }
+                }
+            }
+        }
+
+        idx   = rmd_rl[j];
+        tmidx = t_base + idx;
+        wmsg  = tmp[tmidx];
+        s     = rmd_sl[j];
+        ki    = rmd_kl[j];
+        tval  = al + fl + wmsg + ki;
+        n32   = 32;
+        inv_s = n32 - s;
+        tmp2  = (tval << s) | (tval >> inv_s);
+        tval  = tmp2 + el;
+        al    = el;
+        el    = dl;
+        tmp2  = (cl << 10) | (cl >> 22);
+        dl    = tmp2;
+        cl    = bl;
+        bl    = tval;
+    }
+
+    // ── Phase 3: RIPEMD-160 right track ──────────────────────────────────────
+    for (int j = 0; j < 80; j = j + 1) {
+        u32 fr;
+        u32 idx;
+        u32 tmidx;
+        u32 wmsg;
+        u32 s;
+        u32 ki;
+        u32 tval;
+        u32 n32;
+        u32 inv_s;
+        u32 tmp2;
+
+        if (j < 16) {
+            fr = br ^ (cr | ~dr);
+        } else {
+            if (j < 32) {
+                fr = (br & dr) | (cr & ~dr);
+            } else {
+                if (j < 48) {
+                    fr = (br | ~cr) ^ dr;
+                } else {
+                    if (j < 64) {
+                        fr = (br & cr) | (~br & dr);
+                    } else {
+                        fr = br ^ cr ^ dr;
+                    }
+                }
+            }
+        }
+
+        idx   = rmd_rr[j];
+        tmidx = t_base + idx;
+        wmsg  = tmp[tmidx];
+        s     = rmd_sr[j];
+        ki    = rmd_kr[j];
+        tval  = ar + fr + wmsg + ki;
+        n32   = 32;
+        inv_s = n32 - s;
+        tmp2  = (tval << s) | (tval >> inv_s);
+        tval  = tmp2 + er;
+        ar    = er;
+        er    = dr;
+        tmp2  = (cr << 10) | (cr >> 22);
+        dr    = tmp2;
+        cr    = br;
+        br    = tval;
+    }
+
+    // ── Final combination ─────────────────────────────────────────────────────
+    u32 fin0; u32 fin1; u32 fin2; u32 fin3; u32 fin4;
+    fin0 = rmd_state[rs1] + cl + dr;
+    fin1 = rmd_state[rs2] + dl + er;
+    fin2 = rmd_state[rs3] + el + ar;
+    fin3 = rmd_state[rs4] + al + br;
+    fin4 = rmd_state[rs0] + bl + cr;
+    rmd_state[rs0] = fin0;
+    rmd_state[rs1] = fin1;
+    rmd_state[rs2] = fin2;
+    rmd_state[rs3] = fin3;
+    rmd_state[rs4] = fin4;
+}
+
+transmission hash160_batch_launch {
+    grid  (64, 1, 1);
+    block (256, 1, 1);
+    motor hash160_batch_u32 {
+        in    R0  u32* sha_msg;
+        inout R1  u32* sha_state;
+        in    R2  u32* sha_k;
+        inout R3  u32 a;
+        inout R4  u32 b;
+        inout R5  u32 c;
+        inout R6  u32 d;
+        inout R7  u32 e;
+        inout R8  u32 f;
+        inout R9  u32 g;
+        inout R10 u32 h;
+        inout R11 u32* tmp;
+        inout R12 u32* rmd_state;
+        in    R13 u32* rmd_rl;
+        in    R14 u32* rmd_rr;
+        in    R15 u32* rmd_sl;
+        in    R16 u32* rmd_sr;
+        in    R17 u32* rmd_kl;
+        in    R18 u32* rmd_kr;
+        inout R19 u32 al;
+        inout R20 u32 bl;
+        inout R21 u32 cl;
+        inout R22 u32 dl;
+        inout R23 u32 el;
+        inout R24 u32 ar;
+        inout R25 u32 br;
+        inout R26 u32 cr;
+        inout R27 u32 dr;
+        inout R28 u32 er;
+    }
+}
